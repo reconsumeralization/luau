@@ -20,14 +20,16 @@ except IndexError:
   pass
 except (ValueError, TypeError):
   cycles_to_run = DEFAULT_CYCLES_TO_RUN
-  print("Error: Cycles to run argument must be an integer. Using default value of {}".format(DEFAULT_CYCLES_TO_RUN))
+  print(
+      f"Error: Cycles to run argument must be an integer. Using default value of {DEFAULT_CYCLES_TO_RUN}"
+  )
 
 # Numpy complains if we provide a cycle count of less than 3 ~ default to 3 whenever a lower value is provided
 cycles_to_run = cycles_to_run if cycles_to_run > 2 else 3
 
-for i in range(1,cycles_to_run):
+for _ in range(1,cycles_to_run):
   start = time.perf_counter()
-  
+
   # Run the code you want to measure here
   os.system(sys.argv[1])
 

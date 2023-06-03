@@ -25,7 +25,7 @@ class Node(svg.Node):
 
     def title(self):
         if self.line > 0:
-            return "{}\n{}:{}".format(self.function, self.source, self.line)
+            return f"{self.function}\n{self.source}:{self.line}"
         else:
             return self.function
 

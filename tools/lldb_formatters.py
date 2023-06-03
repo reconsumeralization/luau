@@ -80,18 +80,17 @@ class LuauVariantSyntheticChildrenProvider:
                     node, '(const char*)"<unknown type>"'
                 )
         elif node == "value":
-            if self.stored_value is not None:
-                if self.current_type is not None:
-                    return self.valobj.CreateValueFromData(
-                        node, self.stored_value.GetData(), self.current_type
-                    )
-                else:
-                    return self.valobj.CreateValueExpression(
-                        node, '(const char*)"<unknown type>"'
-                    )
-            else:
+            if self.stored_value is None:
                 return self.valobj.CreateValueFromExpression(
                     node, '(const char*)"<no stored value>"'
+                )
+            if self.current_type is not None:
+                return self.valobj.CreateValueFromData(
+                    node, self.stored_value.GetData(), self.current_type
+                )
+            else:
+                return self.valobj.CreateValueExpression(
+                    node, '(const char*)"<unknown type>"'
                 )
         else:
             return None
@@ -134,10 +133,7 @@ class DenseHashTableSyntheticChildrenProvider:
     def get_child_index(self, name):
         """this call should return the index of the synthetic child whose name is given as argument"""
         try:
-            if name.startswith("[") and name.endswith("]"):
-                return int(name[1:-1])
-            else:
-                return -1
+            return int(name[1:-1]) if name.startswith("[") and name.endswith("]") else -1
         except Exception as e:
             print("get_child_index exception", e)
             return -1
@@ -191,10 +187,7 @@ class AstArraySyntheticChildrenProvider:
 
     def get_child_index(self, name):
         try:
-            if name.startswith("[") and name.endswith("]"):
-                return int(name[1:-1])
-            else:
-                return -1
+            return int(name[1:-1]) if name.startswith("[") and name.endswith("]") else -1
         except Exception as e:
             print("get_child_index error:", e)
 

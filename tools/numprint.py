@@ -37,10 +37,7 @@ def pow10approx(n):
 
 def pow5_64(n):
 	assert(n >= 0)
-	if n == 0:
-		return 1 << 63
-	else:
-		return high128(5**n, False) >> 64
+	return 1 << 63 if n == 0 else high128(5**n, False) >> 64
 
 if not compact:
 	print("// kPow10Table", pow10min, "..", pow10max)
@@ -48,13 +45,12 @@ if not compact:
 	for p in range(pow10min, pow10max + 1):
 		h = hex(pow10approx(p))[2:]
 		assert(len(h) == 32)
-		print("    {0x%s, 0x%s}," % (h[0:16].upper(), h[16:32].upper()))
-	print("}")
+		print("    {0x%s, 0x%s}," % (h[:16].upper(), h[16:32].upper()))
 else:
 	print("// kPow5Table")
 	print("{")
 	for i in range(16):
-		print("    " + hex(pow5_64(i)) + ",")
+		print(f"    {hex(pow5_64(i))},")
 	print("}")
 	print("// kPow10Table", pow10min, "..", pow10max)
 	print("{")
@@ -78,5 +74,5 @@ else:
 		assert(len(hbase) == 32)
 		assert(errw < 1 << 64)
 
-		print("    {0x%s, 0x%s, 0x%16x}," % (hbase[0:16], hbase[16:32], errw))
-	print("}")
+		print("    {0x%s, 0x%s, 0x%16x}," % (hbase[:16], hbase[16:32], errw))
+print("}")

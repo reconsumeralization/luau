@@ -14,7 +14,6 @@ class TablePrinter(object):
         self._columns = columns
         self._widths = [len(col['label']) for col in self._columns]
         self._rows = []
-        pass
 
     def _convert_field_dict_to_ordered_list(self, fields:Dict[str, object]):
         assert(len(fields) == len(self._columns))
@@ -40,7 +39,6 @@ class TablePrinter(object):
             }[actual_align_style]
             print('{0:{align_style}{align_width}}'.format(value, align_style=align_char, align_width=align_width), end=' ')
         print()
-        pass
 
     def _print_horizontal_separator(self):
         for i, align_width in enumerate(self._widths):
@@ -48,7 +46,6 @@ class TablePrinter(object):
                 print('-+-', end='')
             print('-' * (align_width+1), end='')
         print()
-        pass
 
     def clean_colorama(self, str):
         return re.compile(r'(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]').sub('', str)
@@ -87,5 +84,3 @@ class TablePrinter(object):
         if summary:
             self._print_horizontal_separator()
             self._print_row(summary_row)
-
-        pass

@@ -31,11 +31,11 @@ class InfluxReporter:
     def _send_line_message(self, tags, fields):
         tags_str = ','.join(sorted(tags))
         fields_str = ','.join(fields)
-        line_message = '{},{} {}'.format('robench', tags_str, fields_str)
+        line_message = f'robench,{tags_str} {fields_str}'
 
         self.lines.append(line_message)
         if self.args.print_influx_debugging:
-            print('[influx] ' + line_message)
+            print(f'[influx] {line_message}')
 
     def flush(self, process_exit_code):
         if self.args.report_metrics:
@@ -46,35 +46,30 @@ class InfluxReporter:
                 # Just log a warning instead.
                 response = requests.post(url=self.args.report_metrics, data=request)
             except Exception as e:
-                print("Unable to report metrics to influx.  Reason: " + str(e))
+                print(f"Unable to report metrics to influx.  Reason: {str(e)}")
                 print('Request content (for debugging): ')
                 print(request)
-                pass
 
     def report_result(self, testFolder, testName, testPath, status, timeMin, timeAvg, timeMax, confInt, vmName, vmPath):
         is_teamcity = 'TEAMCITY_PROJECT_NAME' in os.environ
         tags = [
-            'hostname={}'.format(tag_value(_hostname)),
-            'is_teamcity={}'.format(tag_value(is_teamcity)),
-            'platform={}'.format(tag_value(sys.platform)),
+            f'hostname={tag_value(_hostname)}',
+            f'is_teamcity={tag_value(is_teamcity)}',
+            f'platform={tag_value(sys.platform)}',
             'type=event',
-
-            # Necessary in order for ElasticSearch to accept this line
             'priority=high',
-
-            'test_folder={}'.format(tag_value(testFolder)),
-            'test_name={}'.format(tag_value(testName)),
-            'test_path={}'.format(tag_value(testPath)),
-
-            'vm_name={}'.format(tag_value(vmName)),
-            'vm_path={}'.format(tag_value(vmPath))
+            f'test_folder={tag_value(testFolder)}',
+            f'test_name={tag_value(testName)}',
+            f'test_path={tag_value(testPath)}',
+            f'vm_name={tag_value(vmName)}',
+            f'vm_path={tag_value(vmPath)}',
         ]
         fields = [
-            'status={}'.format(field_value(status)),
-            'time_min={}'.format(timeMin),
-            'time_avg={}'.format(timeAvg),
-            'time_max={}'.format(timeMax),
-            'time_conf_int={}'.format(confInt)
+            f'status={field_value(status)}',
+            f'time_min={timeMin}',
+            f'time_avg={timeAvg}',
+            f'time_max={timeMax}',
+            f'time_conf_int={confInt}',
         ]
 
         self._send_line_message(tags, fields)

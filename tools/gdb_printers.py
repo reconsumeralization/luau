@@ -8,7 +8,7 @@ class VariantPrinter:
         typeId = int(self.val['typeId'])
         type = self.val.type.template_argument(typeId)
         value = self.val['storage'].reinterpret_cast(type.pointer()).dereference()
-        return type.name + " [" + str(value) + "]"
+        return f"{type.name} [{str(value)}]"
 
 def match_printer(val):
     type = val.type.strip_typedefs()

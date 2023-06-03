@@ -44,7 +44,7 @@ for l in data:
     # Track stack of each thread, but aggregate values together
     tid = l["tid"]
 
-    if not tid in stacks:
+    if tid not in stacks:
         stacks[tid] = []
     stack = stacks[tid]
 
@@ -62,7 +62,7 @@ for l in data:
                     if len(description) != 0:
                         description += ", "
 
-                    description += "{}: {}".format(arg, e["args"][arg])
+                    description += f'{arg}: {e["args"][arg]}'
 
             child = node.child(caption + description)
             child.caption = caption

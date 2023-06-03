@@ -53,10 +53,10 @@ def wrap_text(text, width):
             else:
                 line_count += 1
                 if line_count == 1:
-                    initial_indent = leading_whitespace_re.match(line).group(1)
+                    initial_indent = leading_whitespace_re.match(line)[1]
                     subsequent_indent = initial_indent
                 elif line_count == 2:
-                    subsequent_indent = leading_whitespace_re.match(line).group(1)
+                    subsequent_indent = leading_whitespace_re.match(line)[1]
                 result += line.strip() + '\n'
 
     result = ''
@@ -149,8 +149,12 @@ class Options:
         self.timeout = args.timeout
         self.interested_in_timeouts = args.timeout != 0
         self.attempts = args.attempts
-        self.parallel = (args.parallel == 'on' or args.parallel == 'default') if args.attempts == 1 else args.parallel == 'on'
-        self.filter = re.compile(".*" + args.filter + ".*") if args.filter else None
+        self.parallel = (
+            args.parallel in ['on', 'default']
+            if args.attempts == 1
+            else args.parallel == 'on'
+        )
+        self.filter = re.compile(f".*{args.filter}.*") if args.filter else None
         self.verbose = args.verbose
         self.other_args = [arg for arg in other_args if arg != '--'] # Useless to have -- here, discard.
 
@@ -210,14 +214,14 @@ def list_fflags(options):
         return None
 
 def mk_flags_argument(options, flags, initial_flags):
-    lst = [flag + '=true' for flag in flags]
+    lst = [f'{flag}=true' for flag in flags]
 
     # When --explicit is provided, we'd like to find the set of flags from initial_flags that's not in active flags.
     # This is so that we can provide a =false value instead of leaving them out to be the default value.
     if options.explicit:
         for flag in initial_flags:
             if flag not in flags:
-                lst.append(flag + '=false')
+                lst.append(f'{flag}=false')
 
     return '--fflags=' + ','.join(lst)
 
@@ -406,13 +410,13 @@ async def do_work(args, other_args):
         argument = '--pass' if sense else '--fail'
         print(f'I\'m bisecting flags as if {argument} was used')
     else:
-        sense = True if args.mode == InterestnessMode.PASS else False
+        sense = args.mode == InterestnessMode.PASS
 
     options = Options(args, other_args, sense)
 
     initial_flags = list_fflags(options)
     if initial_flags is None:
-        print('I cannot bisect flags with ' + options.path, file=sys.stderr)
+        print(f'I cannot bisect flags with {options.path}', file=sys.stderr)
         print('These are required for me to be able to cooperate:', file=sys.stderr)
         print('\t--list-fflags must print a list of flags separated by newlines, including FFlag prefix', file=sys.stderr)
         print('\t--fflags=... to accept a comma-separated pair of flag names and their value in the form FFlagFoo=true', file=sys.stderr)

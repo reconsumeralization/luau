@@ -41,16 +41,21 @@ class Node(svg.Node):
 
 def getkey(heap, obj, key):
     pairs = obj.get("pairs", [])
-    for i in range(0, len(pairs), 2):
-        if pairs[i] and heap[pairs[i]]["type"] == "string" and heap[pairs[i]]["data"] == key:
-            if pairs[i + 1] and heap[pairs[i + 1]]["type"] == "string":
-                return heap[pairs[i + 1]]["data"]
-            else:
-                return None
-    return None
+    return next(
+        (
+            heap[pairs[i + 1]]["data"]
+            if pairs[i + 1] and heap[pairs[i + 1]]["type"] == "string"
+            else None
+            for i in range(0, len(pairs), 2)
+            if pairs[i]
+            and heap[pairs[i]]["type"] == "string"
+            and heap[pairs[i]]["data"] == key
+        ),
+        None,
+    )
 
 # load files
-if arguments.snapshotnew == None:
+if arguments.snapshotnew is None:
     dumpold = None
     with open(arguments.snapshot) as f:
         dump = json.load(f)
@@ -64,13 +69,10 @@ heap = dump["objects"]
 
 # reachability analysis: how much of the heap is reachable from roots?
 visited = set()
-queue = []
 offset = 0
 root = Node()
 
-for name, addr in dump["roots"].items():
-    queue.append((addr, root.child(name)))
-
+queue = [(addr, root.child(name)) for name, addr in dump["roots"].items()]
 while offset < len(queue):
     addr, node = queue[offset]
     offset += 1
@@ -80,7 +82,7 @@ while offset < len(queue):
     visited.add(addr)
     obj = heap[addr]
 
-    if not dumpold or not addr in dumpold["objects"]:
+    if not dumpold or addr not in dumpold["objects"]:
         node.count += 1
         node.size += obj["size"]
         node.objects.append(obj)
@@ -91,8 +93,7 @@ while offset < len(queue):
         weakval = False
 
         if "metatable" in obj:
-            modemt = getkey(heap, heap[obj["metatable"]], "__mode")
-            if modemt:
+            if modemt := getkey(heap, heap[obj["metatable"]], "__mode"):
                 weakkey = "k" in modemt
                 weakval = "v" in modemt
 
@@ -110,8 +111,7 @@ while offset < len(queue):
                 if val and not weakval:
                     queue.append((val, node))
 
-        for a in obj.get("array", []):
-            queue.append((a, node))
+        queue.extend((a, node) for a in obj.get("array", []))
         if "metatable" in obj:
             queue.append((obj["metatable"], node.child("__meta")))
     elif obj["type"] == "function":
@@ -123,10 +123,8 @@ while offset < len(queue):
             if "source" in proto:
                 source = proto["source"]
 
-        if "proto" in obj:
             queue.append((obj["proto"], node.child("__proto")))
-        for a in obj.get("upvalues", []):
-            queue.append((a, node.child(source)))
+        queue.extend((a, node.child(source)) for a in obj.get("upvalues", []))
     elif obj["type"] == "userdata":
         if "metatable" in obj:
             queue.append((obj["metatable"], node.child("__meta")))
@@ -143,10 +141,8 @@ while offset < len(queue):
                 name = None
             queue.append((stack[i], framenode.child(name) if framenode and name else framenode or stacknode))
     elif obj["type"] == "proto":
-        for a in obj.get("constants", []):
-            queue.append((a, node))
-        for a in obj.get("protos", []):
-            queue.append((a, node))
+        queue.extend((a, node) for a in obj.get("constants", []))
+        queue.extend((a, node) for a in obj.get("protos", []))
     elif obj["type"] == "upvalue":
         if "object" in obj:
             queue.append((obj["object"], node))
@@ -169,9 +165,7 @@ def filteredTreeForCategory(node, category):
 
     for c in node.children.values():
         if category in c.categories:
-            filtered = filteredTreeForCategory(c, category)
-
-            if filtered:
+            if filtered := filteredTreeForCategory(c, category):
                 children[filtered.name] = filtered
 
     if len(children):
@@ -205,9 +199,7 @@ def splitIntoCategories(root):
     result = Node()
 
     for i in range(0, 256):
-        filtered = filteredTreeForCategory(root, i)
-
-        if filtered:
+        if filtered := filteredTreeForCategory(root, i):
             name = dump["stats"]["categories"][str(i)]["name"]
 
             filtered.name = name

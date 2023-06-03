@@ -24,9 +24,7 @@ class Node:
         while offset < len(result):
             p = result[offset]
             offset += 1
-            for c in p.children.values():
-                result.append(c)
-
+            result.extend(iter(p.children.values()))
         return result
 
 def escape(s):
@@ -486,7 +484,7 @@ def display(root, title, colors, flip = False):
 
         if chars >= 3:
             if chars < len(text):
-                text = text[:int(chars-2)] + ".."
+                text = f"{text[:int(chars - 2)]}.."
         else:
             text = ""
 

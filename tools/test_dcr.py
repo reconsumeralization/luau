@@ -77,10 +77,7 @@ class Handler(x.ContentHandler):
                 self.crashed_tests.append(makeDottedName(self.currentTest))
 
     def endElement(self, name):
-        if name == "TestCase":
-            self.currentTest.pop()
-
-        elif name == "TestSuite":
+        if name in ["TestCase", "TestSuite"]:
             self.currentTest.pop()
 
 
@@ -141,7 +138,7 @@ def main():
     commandLine = [args.path, "--reporters=xml", "--fflags=" + ",".join(flags)]
 
     if args.random_seed:
-        commandLine.append("--random-seed=" + str(args.random_seed))
+        commandLine.append(f"--random-seed={str(args.random_seed)}")
     elif args.randomize:
         commandLine.append("--randomize")
 
@@ -225,7 +222,7 @@ def main():
         not handler.crashed_tests
         and handler.numSkippedTests == 0
         and all(
-            not passed == (dottedName in failList)
+            passed != (dottedName in failList)
             for dottedName, passed in handler.results.items()
         )
     )

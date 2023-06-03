@@ -62,7 +62,7 @@ def parse_objdump_assembly(in_file):
             mo = stack_alloc.fullmatch(line)
             if mo:
                 lr.consume_blank_lines()
-                return int(mo.group(1))
+                return int(mo[1])
 
     # Find beginning of disassembly
     while not text_section_re.fullmatch(lr.get_line()):
@@ -77,7 +77,7 @@ def parse_objdump_assembly(in_file):
         mo = symbol_re.fullmatch(line)
         # Found a symbol
         if mo:
-            symbol = mo.group(1)
+            symbol = mo[1]
             stack_size = find_stack_alloc_size()
             if stack_size != None:
                 results[symbol] = stack_size
@@ -105,7 +105,7 @@ def parse_dumpbin_assembly(in_file):
             mo = stack_alloc.fullmatch(line)
             if mo:
                 lr.consume_blank_lines()
-                return int(mo.group(1), 16) # return value in decimal
+                return int(mo[1], 16)
 
     # Find beginning of disassembly
     while not file_type_re.fullmatch(lr.get_line()):
@@ -122,7 +122,7 @@ def parse_dumpbin_assembly(in_file):
         mo = symbol_re.fullmatch(line)
         # Found a symbol
         if mo:
-            symbol = mo.group(1)
+            symbol = mo[1]
             stack_size = find_stack_alloc_size()
             if stack_size != None:
                 results[symbol] = stack_size
