@@ -38,17 +38,17 @@ for line in sys.stdin.buffer.readlines():
 
 def display(name, counts, limit=None, extra=None):
     items = sorted(counts.items(), key=lambda p: p[1], reverse=True)
-    total = 0
-    for k,v in items:
-        total += v
+    total = sum(v for k, v in items)
     shown = 0
     print(name)
-    for i, (k,v) in enumerate(items):
+    for i, (k, v) in enumerate(items):
         if i == limit:
             if shown < total:
                 print(f'  {"Others":25}: {total-shown} ({(total-shown)/total*100:.1f}%)')
             break
-        print(f'  {k:25}: {v} ({v/total*100:.1f}%){"; "+extra(k) if extra else ""}')
+        print(
+            f'  {k:25}: {v} ({v / total * 100:.1f}%){f"; {extra(k)}" if extra else ""}'
+        )
         shown += v
     print()
 

@@ -15,7 +15,7 @@ class Node:
 
     def title(self):
         if self.line > 0:
-            return "{} ({}:{})".format(self.function, self.source, self.line)
+            return f"{self.function} ({self.source}:{self.line})"
         else:
             return self.function
 
@@ -43,7 +43,7 @@ for l in dump:
         node.source = source
         node.line = int(line) if len(line) > 0 else 0
 
-        if not node in hier:
+        if node not in hier:
             node.hier_ticks += int(ticks)
             hier[node] = True
 

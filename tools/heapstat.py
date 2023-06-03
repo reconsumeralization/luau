@@ -17,13 +17,18 @@ def sortedsize(p):
 
 def getkey(heap, obj, key):
     pairs = obj.get("pairs", [])
-    for i in range(0, len(pairs), 2):
-        if pairs[i] and heap[pairs[i]]["type"] == "string" and heap[pairs[i]]["data"] == key:
-            if pairs[i + 1] and heap[pairs[i + 1]]["type"] == "string":
-                return heap[pairs[i + 1]]["data"]
-            else:
-                return None
-    return None
+    return next(
+        (
+            heap[pairs[i + 1]]["data"]
+            if pairs[i + 1] and heap[pairs[i + 1]]["type"] == "string"
+            else None
+            for i in range(0, len(pairs), 2)
+            if pairs[i]
+            and heap[pairs[i]]["type"] == "string"
+            and heap[pairs[i]]["data"] == key
+        ),
+        None,
+    )
 
 with open(sys.argv[1]) as f:
     dump = json.load(f)
@@ -54,7 +59,7 @@ print("userdata by __type:")
 for type, (count, size) in sortedsize(size_udata.items()):
     print(type.ljust(20), str(size).rjust(8), "bytes", str(count).rjust(5), "objects")
 
-if len(size_category) != 0:
+if size_category:
     print()
 
     print("objects by category:")

@@ -30,7 +30,12 @@ defaultVm = 'luau.exe' if os.name == "nt" else './luau'
 
 argumentParser = argparse.ArgumentParser(description='Benchmark Lua script execution with an option to compare different VMs')
 
-argumentParser.add_argument('--vm', dest='vm',default=defaultVm,help='Lua executable to test (' + defaultVm + ' by default)')
+argumentParser.add_argument(
+    '--vm',
+    dest='vm',
+    default=defaultVm,
+    help=f'Lua executable to test ({defaultVm} by default)',
+)
 argumentParser.add_argument('--folder', dest='folder',default=os.path.join(scriptdir, 'tests'),help='Folder with tests (tests by default)')
 argumentParser.add_argument('--compare', dest='vmNext',type=str,nargs='*',help='List of Lua executables to compare against')
 argumentParser.add_argument('--results', dest='results',type=str,nargs='*',help='List of json result files to compare and graph')
@@ -58,20 +63,10 @@ argumentParser.add_argument('--no-print-final-summary', action='store_false', de
 CALLGRIND_INSN_PER_SEC = 2.5 * 4e9
 
 def arrayRange(count):
-    result = []
-
-    for i in range(count):
-        result.append(i)
-
-    return result
+    return list(range(count))
 
 def arrayRangeOffset(count, offset):
-    result = []
-
-    for i in range(count):
-        result.append(i + offset)
-
-    return result
+    return [i + offset for i in range(count)]
 
 def getCallgrindOutput(lines):
     result = []
@@ -83,7 +78,7 @@ def getCallgrindOutput(lines):
         elif l.startswith("summary: ") and name != None:
             insn = int(l[9:])
             # Note: we only run each bench once under callgrind so we only report a single time per run; callgrind instruction count variance is ~0.01% so it might as well be zero
-            result += "|><|" + name + "|><|" + str(insn / CALLGRIND_INSN_PER_SEC * 1000.0) + "||_||"
+            result += f"|><|{name}|><|{str(insn / CALLGRIND_INSN_PER_SEC * 1000.0)}||_||"
             name = None
 
     return "".join(result)
@@ -104,7 +99,7 @@ def getVmOutput(cmd):
             return ""
     elif arguments.callgrind:
         try:
-            fullCmd = "valgrind --tool=callgrind --callgrind-out-file=callgrind.out --combine-dumps=yes --dump-line=no " + cmd
+            fullCmd = f"valgrind --tool=callgrind --callgrind-out-file=callgrind.out --combine-dumps=yes --dump-line=no {cmd}"
             conditionallyShowCommand(fullCmd)
             subprocess.check_call(fullCmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=scriptdir)
             path = os.path.join(scriptdir, "callgrind.out")
@@ -134,7 +129,7 @@ def getShortVmName(name):
     argumentPos = name.find(" ")
 
     if argumentPos != -1:
-        executableName = name[0:argumentPos]
+        executableName = name[:argumentPos]
         arguments = name[argumentPos+1:]
 
         pathPos = executableName.rfind("\\")
@@ -145,17 +140,14 @@ def getShortVmName(name):
         if pathPos != -1:
             executableName = executableName[pathPos+1:]
 
-        return executableName + " " + arguments
+        return f"{executableName} {arguments}"
 
     pathPos = name.rfind("\\")
 
     if pathPos == -1:
         pathPos = name.rfind("/")
 
-    if pathPos != -1:
-        return name[pathPos+1:]
-
-    return name
+    return name[pathPos+1:] if pathPos != -1 else name
 
 class TestResult:
     filename = ""
@@ -188,11 +180,7 @@ def extractResult(filename, vm, output):
     result.name = elements[0]
     elements.remove(elements[0])
 
-    timeTable = []
-
-    for el in elements:
-        timeTable.append(float(el))
-
+    timeTable = [float(el) for el in elements]
     result.values = timeTable
     result.count = len(timeTable)
 
@@ -213,19 +201,15 @@ def finalizeResult(result):
 
     # Compute basic parameters
     for v in result.values:
-        if result.min == None or v < result.min:
+        if result.min is None or v < result.min:
             result.min = v
 
-        if result.max == None or v > result.max:
+        if result.max is None or v > result.max:
             result.max = v
 
         total = total + v
 
-    if result.count > 0:
-        result.avg = total / result.count
-    else:
-        result.avg = 0
-
+    result.avg = total / result.count if result.count > 0 else 0
     # Compute standard deviation
     sumOfSquares = 0
 
@@ -277,7 +261,7 @@ mainTotalMax = 0
 def getExtraArguments(filepath):
     try:
         with open(filepath) as f:
-            for i in f.readlines():
+            for i in f:
                 pos = i.find("--bench-args:")
                 if pos != -1:
                     return i[pos + 13:].strip()
@@ -293,7 +277,7 @@ def substituteArguments(cmd, extra):
     if cmd.find("@EXTRA") != -1:
         cmd = cmd.replace("@EXTRA", extra)
     else:
-        cmd = cmd + " " + extra
+        cmd = f"{cmd} {extra}"
 
     return cmd
 
@@ -316,9 +300,7 @@ def extractResults(filename, vm, output, allowFailure):
 
     splitOutput.remove(splitOutput[len(splitOutput) - 1])
 
-    for el in splitOutput:
-        results.append(extractResult(filename, vm, el))
-
+    results.extend(extractResult(filename, vm, el) for el in splitOutput)
     return results
 
 def analyzeResult(subdir, main, comparisons):
@@ -329,7 +311,16 @@ def analyzeResult(subdir, main, comparisons):
     mainTotalAverage = mainTotalAverage + main.avg
     mainTotalMax = mainTotalMax + main.max
 
-    if arguments.vmNext != None:
+    if arguments.vmNext is None:
+        resultPrinter.add_row({
+            'Test': main.name,
+            'Min': '{:8.3f}ms'.format(main.min),
+            'Average': '{:8.3f}ms'.format(main.avg),
+            'StdDev%': '{:8.3f}%'.format(main.sampleConfidenceInterval / main.avg * 100),
+            'Driver': main.shortVm
+        })
+
+    else:
         resultPrinter.add_row({
             'Test': main.name,
             'Min': '{:8.3f}ms'.format(main.min),
@@ -340,15 +331,6 @@ def analyzeResult(subdir, main, comparisons):
             'Significance': "",
             'P(T<=t)': ""
         })
-    else:
-        resultPrinter.add_row({
-            'Test': main.name,
-            'Min': '{:8.3f}ms'.format(main.min),
-            'Average': '{:8.3f}ms'.format(main.avg),
-            'StdDev%': '{:8.3f}%'.format(main.sampleConfidenceInterval / main.avg * 100),
-            'Driver': main.shortVm
-        })
-
     if influxReporter != None:
         influxReporter.report_result(subdir, main.name, main.filename, "SUCCESS", main.min, main.avg, main.max, main.sampleConfidenceInterval, main.shortVm, main.vm)
 
@@ -368,11 +350,7 @@ def analyzeResult(subdir, main, comparisons):
         vmTotalImprovement.append(0.0)
         vmTotalResults.append(0)
 
-    if arguments.absolute or arguments.speedup:
-        scale = 1
-    else:
-        scale = 100 / main.avg
-
+    scale = 1 if arguments.absolute or arguments.speedup else 100 / main.avg
     plotValueLists[index].append(main.avg * scale)
     plotConfIntLists[index].append(main.sampleConfidenceInterval * scale)
 
@@ -391,7 +369,7 @@ def analyzeResult(subdir, main, comparisons):
             vmTotalImprovement.append(0.0)
             vmTotalResults.append(0)
 
-        if compare.min == None:
+        if compare.min is None:
             print(colored(Color.RED, 'FAILED') + ":  '" + main.name + "' on '" + compare.vm +  "'")
 
             resultPrinter.add_row({ 'Test': main.name, 'Min': "", 'Average': "FAILED", 'StdDev%': "", 'Driver': compare.shortVm, 'Speedup': "", 'Significance': "", 'P(T<=t)': "" })
@@ -479,17 +457,19 @@ def runTest(subdir, filename, filepath):
     mainVm = os.path.abspath(arguments.vm)
 
     # Process output will contain the test name and execution times
-    mainOutput = getVmOutput(substituteArguments(mainVm, getExtraArguments(filepath)) + " " + filepath)
+    mainOutput = getVmOutput(
+        f"{substituteArguments(mainVm, getExtraArguments(filepath))} {filepath}"
+    )
     mainResultSet = extractResults(filename, mainVm, mainOutput, False)
 
     if len(mainResultSet) == 0:
         print(colored(Color.RED, 'FAILED') + ":  '" + filepath + "' on '" + mainVm +  "'")
 
-        if arguments.vmNext != None:
-            resultPrinter.add_row({ 'Test': filepath, 'Min': "", 'Average': "FAILED", 'StdDev%': "", 'Driver': getShortVmName(mainVm), 'Speedup': "", 'Significance': "", 'P(T<=t)': "" })
-        else:
+        if arguments.vmNext is None:
             resultPrinter.add_row({ 'Test': filepath, 'Min': "", 'Average': "FAILED", 'StdDev%': "", 'Driver': getShortVmName(mainVm) })
 
+        else:
+            resultPrinter.add_row({ 'Test': filepath, 'Min': "", 'Average': "FAILED", 'StdDev%': "", 'Driver': getShortVmName(mainVm), 'Speedup': "", 'Significance': "", 'P(T<=t)': "" })
         if influxReporter != None:
             influxReporter.report_result(subdir, filename, filename, "FAILED", 0.0, 0.0, 0.0, 0.0, getShortVmName(mainVm), mainVm)
         return
@@ -500,7 +480,9 @@ def runTest(subdir, filename, filepath):
         for compareVm in arguments.vmNext:
             compareVm = os.path.abspath(compareVm)
 
-            compareOutput = getVmOutput(substituteArguments(compareVm, getExtraArguments(filepath)) + " " + filepath)
+            compareOutput = getVmOutput(
+                f"{substituteArguments(compareVm, getExtraArguments(filepath))} {filepath}"
+            )
             compareResultSet = extractResults(filename, compareVm, compareOutput, True)
 
             compareResultSets.append(compareResultSet)
@@ -508,22 +490,23 @@ def runTest(subdir, filename, filepath):
     if arguments.extra_loops > 0:
         # get more results
         for i in range(arguments.extra_loops):
-            extraMainOutput = getVmOutput(substituteArguments(mainVm, getExtraArguments(filepath)) + " " + filepath)
+            extraMainOutput = getVmOutput(
+                f"{substituteArguments(mainVm, getExtraArguments(filepath))} {filepath}"
+            )
             extraMainResultSet = extractResults(filename, mainVm, extraMainOutput, False)
 
             mergeResults(mainResultSet, extraMainResultSet)
 
             if arguments.vmNext != None:
-                i = 0
-                for compareVm in arguments.vmNext:
+                for i, compareVm in enumerate(arguments.vmNext):
                     compareVm = os.path.abspath(compareVm)
 
-                    extraCompareOutput = getVmOutput(substituteArguments(compareVm, getExtraArguments(filepath)) + " " + filepath)
+                    extraCompareOutput = getVmOutput(
+                        f"{substituteArguments(compareVm, getExtraArguments(filepath))} {filepath}"
+                    )
                     extraCompareResultSet = extractResults(filename, compareVm, extraCompareOutput, True)
 
                     mergeResults(compareResultSets[i], extraCompareResultSet)
-                    i += 1
-
     # finalize results
     for result in mainResultSet:
         finalizeResult(result)
@@ -551,12 +534,8 @@ def runTest(subdir, filename, filepath):
 
         analyzeResult(subdir, mainResult, compareResults)
 
-        mergedResults = []
-        mergedResults.append(mainResult)
-
-        for el in compareResults:
-            mergedResults.append(el)
-
+        mergedResults = [mainResult]
+        mergedResults.extend(iter(compareResults))
         allResults.append(mergedResults)
 
 def rearrangeSortKeyForComparison(e):
@@ -580,11 +559,7 @@ def rearrange(key):
 
     # Recreate value lists in sorted order
     plotLabelsPrev = plotLabels
-    plotLabels = []
-
-    for i in index:
-        plotLabels.append(plotLabelsPrev[i])
-
+    plotLabels = [plotLabelsPrev[i] for i in index]
     for group in range(len(plotValueLists)):
         plotValueListPrev = plotValueLists[group]
         plotValueLists[group] = []
@@ -605,13 +580,11 @@ def graph():
     ind = arrayRange(len(plotLabels))
     width = 0.8 / len(plotValueLists)
 
+    # Extend graph width when we have a lot of tests to draw
+    barcount = len(plotValueLists[0])
     if arguments.graph_vertical:
-        # Extend graph width when we have a lot of tests to draw
-        barcount = len(plotValueLists[0])
         plt.figure(figsize=(max(8, barcount * 0.3), 8))
     else:
-        # Extend graph height when we have a lot of tests to draw
-        barcount = len(plotValueLists[0])
         plt.figure(figsize=(8, max(8, barcount * 0.3)))
 
     plotBars = []
@@ -662,7 +635,7 @@ def graph():
 
     plt.tight_layout()
 
-    plt.savefig(arguments.filename + ".png", dpi=200)
+    plt.savefig(f"{arguments.filename}.png", dpi=200)
 
     if arguments.window:
         plt.show()
@@ -671,7 +644,16 @@ def addTotalsToTable():
     if len(vmTotalMin) == 0:
         return
 
-    if arguments.vmNext != None:
+    if arguments.vmNext is None:
+        resultPrinter.add_row({
+            'Test': 'Total',
+            'Min': '{:8.3f}ms'.format(vmTotalMin[0]),
+            'Average': '{:8.3f}ms'.format(vmTotalAverage[0]),
+            'StdDev%': "---",
+            'Driver': getShortVmName(os.path.abspath(arguments.vm))
+        })
+
+    else:
         index = 0
 
         resultPrinter.add_row({
@@ -700,16 +682,9 @@ def addTotalsToTable():
                 'Significance': "",
                 'P(T<=t)': ""
             })
-    else:
-        resultPrinter.add_row({
-            'Test': 'Total',
-            'Min': '{:8.3f}ms'.format(vmTotalMin[0]),
-            'Average': '{:8.3f}ms'.format(vmTotalAverage[0]),
-            'StdDev%': "---",
-            'Driver': getShortVmName(os.path.abspath(arguments.vm))
-        })
 
 def writeResultsToFile():
+
     class TestResultEncoder(json.JSONEncoder):
         def default(self, obj):
             if isinstance(obj, TestResult):
@@ -717,7 +692,7 @@ def writeResultsToFile():
             return json.JSONEncoder.default(self, obj)
 
     try:
-        with open(arguments.filename + ".json", "w") as allResultsFile:
+        with open(f"{arguments.filename}.json", "w") as allResultsFile:
             allResultsFile.write(json.dumps(allResults, cls=TestResultEncoder))
     except:
         print("Failed to write results to a file")
