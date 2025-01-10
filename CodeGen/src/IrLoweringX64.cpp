@@ -1,12 +1,11 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "IrLoweringX64.h"
 
-#include "Luau/CodeGen.h"
 #include "Luau/DenseHash.h"
-#include "Luau/IrAnalysis.h"
-#include "Luau/IrCallWrapperX64.h"
-#include "Luau/IrDump.h"
+#include "Luau/IrData.h"
 #include "Luau/IrUtils.h"
+
+#include "Luau/IrCallWrapperX64.h"
 
 #include "EmitBuiltinsX64.h"
 #include "EmitCommonX64.h"
@@ -14,6 +13,10 @@
 #include "NativeState.h"
 
 #include "lstate.h"
+#include "lgc.h"
+
+LUAU_FASTFLAG(LuauVectorLibNativeDot)
+LUAU_FASTFLAG(LuauCodeGenVectorDeadStoreElim)
 
 namespace Luau
 {
@@ -22,20 +25,22 @@ namespace CodeGen
 namespace X64
 {
 
-IrLoweringX64::IrLoweringX64(AssemblyBuilderX64& build, ModuleHelpers& helpers, NativeState& data, IrFunction& function)
+IrLoweringX64::IrLoweringX64(AssemblyBuilderX64& build, ModuleHelpers& helpers, IrFunction& function, LoweringStats* stats)
     : build(build)
     , helpers(helpers)
-    , data(data)
     , function(function)
-    , regs(build, function)
+    , stats(stats)
+    , regs(build, function, stats)
     , valueTracker(function)
+    , exitHandlerMap(~0u)
 {
-    // In order to allocate registers during lowering, we need to know where instruction results are last used
-    updateLastUseLocations(function);
-
-    valueTracker.setRestoreCallack(&regs, [](void* context, IrInst& inst) {
-        ((IrRegAllocX64*)context)->restore(inst, false);
-    });
+    valueTracker.setRestoreCallack(
+        &regs,
+        [](void* context, IrInst& inst)
+        {
+            ((IrRegAllocX64*)context)->restore(inst, false);
+        }
+    );
 
     build.align(kFunctionAlignment, X64::AlignmentDataX64::Ud2);
 }
@@ -54,12 +59,12 @@ void IrLoweringX64::storeDoubleAsFloat(OperandX64 dst, IrOp src)
     }
     else
     {
-        LUAU_ASSERT(!"Unsupported instruction form");
+        CODEGEN_ASSERT(!"Unsupported instruction form");
     }
     build.vmovss(dst, tmp.reg);
 }
 
-void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
+void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, const IrBlock& next)
 {
     regs.currInstIdx = index;
 
@@ -79,7 +84,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         else if (inst.a.kind == IrOpKind::Inst)
             build.mov(inst.regX64, dword[regOp(inst.a) + offsetof(TValue, tt)]);
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         break;
     case IrCmd::LOAD_POINTER:
         inst.regX64 = regs.allocReg(SizeX64::qword, index);
@@ -93,7 +98,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         else if (inst.a.kind == IrOpKind::Inst)
             build.mov(inst.regX64, qword[regOp(inst.a) + offsetof(TValue, value)]);
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         break;
     case IrCmd::LOAD_DOUBLE:
         inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
@@ -103,30 +108,41 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         else if (inst.a.kind == IrOpKind::VmConst)
             build.vmovsd(inst.regX64, luauConstantValue(vmConstOp(inst.a)));
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         break;
     case IrCmd::LOAD_INT:
         inst.regX64 = regs.allocReg(SizeX64::dword, index);
 
         build.mov(inst.regX64, luauRegValueInt(vmRegOp(inst.a)));
         break;
-    case IrCmd::LOAD_TVALUE:
+    case IrCmd::LOAD_FLOAT:
         inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
+
+        if (inst.a.kind == IrOpKind::VmReg)
+            build.vcvtss2sd(inst.regX64, inst.regX64, dword[rBase + vmRegOp(inst.a) * sizeof(TValue) + offsetof(TValue, value) + intOp(inst.b)]);
+        else if (inst.a.kind == IrOpKind::VmConst)
+            build.vcvtss2sd(
+                inst.regX64, inst.regX64, dword[rConstants + vmConstOp(inst.a) * sizeof(TValue) + offsetof(TValue, value) + intOp(inst.b)]
+            );
+        else
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        break;
+    case IrCmd::LOAD_TVALUE:
+    {
+        inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
+
+        int addrOffset = inst.b.kind != IrOpKind::None ? intOp(inst.b) : 0;
 
         if (inst.a.kind == IrOpKind::VmReg)
             build.vmovups(inst.regX64, luauReg(vmRegOp(inst.a)));
         else if (inst.a.kind == IrOpKind::VmConst)
             build.vmovups(inst.regX64, luauConstant(vmConstOp(inst.a)));
         else if (inst.a.kind == IrOpKind::Inst)
-            build.vmovups(inst.regX64, xmmword[regOp(inst.a)]);
+            build.vmovups(inst.regX64, xmmword[regOp(inst.a) + addrOffset]);
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         break;
-    case IrCmd::LOAD_NODE_VALUE_TV:
-        inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
-
-        build.vmovups(inst.regX64, luauNodeValue(regOp(inst.a)));
-        break;
+    }
     case IrCmd::LOAD_ENV:
         inst.regX64 = regs.allocReg(SizeX64::qword, index);
 
@@ -155,7 +171,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         }
         else
         {
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         }
         break;
     case IrCmd::GET_SLOT_NODE_ADDR:
@@ -186,56 +202,160 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         build.add(inst.regX64, tmp.reg);
         break;
     };
+    case IrCmd::GET_CLOSURE_UPVAL_ADDR:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::qword, index, {inst.a});
+
+        if (inst.a.kind == IrOpKind::Undef)
+        {
+            build.mov(inst.regX64, sClosure);
+        }
+        else
+        {
+            RegisterX64 cl = regOp(inst.a);
+            if (inst.regX64 != cl)
+                build.mov(inst.regX64, cl);
+        }
+
+        build.add(inst.regX64, offsetof(Closure, l.uprefs) + sizeof(TValue) * vmUpvalueOp(inst.b));
+        break;
+    }
     case IrCmd::STORE_TAG:
         if (inst.b.kind == IrOpKind::Constant)
-            build.mov(luauRegTag(vmRegOp(inst.a)), tagOp(inst.b));
+        {
+            if (inst.a.kind == IrOpKind::Inst)
+                build.mov(dword[regOp(inst.a) + offsetof(TValue, tt)], tagOp(inst.b));
+            else
+                build.mov(luauRegTag(vmRegOp(inst.a)), tagOp(inst.b));
+        }
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+        {
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        }
         break;
     case IrCmd::STORE_POINTER:
-        build.mov(luauRegValue(vmRegOp(inst.a)), regOp(inst.b));
+    {
+        OperandX64 valueLhs = inst.a.kind == IrOpKind::Inst ? qword[regOp(inst.a) + offsetof(TValue, value)] : luauRegValue(vmRegOp(inst.a));
+
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            CODEGEN_ASSERT(intOp(inst.b) == 0);
+            build.mov(valueLhs, 0);
+        }
+        else if (inst.b.kind == IrOpKind::Inst)
+        {
+            build.mov(valueLhs, regOp(inst.b));
+        }
+        else
+        {
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        }
+        break;
+    }
+    case IrCmd::STORE_EXTRA:
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            if (inst.a.kind == IrOpKind::Inst)
+                build.mov(dword[regOp(inst.a) + offsetof(TValue, extra)], intOp(inst.b));
+            else
+                build.mov(luauRegExtra(vmRegOp(inst.a)), intOp(inst.b));
+        }
+        else
+        {
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        }
         break;
     case IrCmd::STORE_DOUBLE:
+    {
+        OperandX64 valueLhs = inst.a.kind == IrOpKind::Inst ? qword[regOp(inst.a) + offsetof(TValue, value)] : luauRegValue(vmRegOp(inst.a));
+
         if (inst.b.kind == IrOpKind::Constant)
         {
             ScopedRegX64 tmp{regs, SizeX64::xmmword};
 
             build.vmovsd(tmp.reg, build.f64(doubleOp(inst.b)));
-            build.vmovsd(luauRegValue(vmRegOp(inst.a)), tmp.reg);
+            build.vmovsd(valueLhs, tmp.reg);
         }
         else if (inst.b.kind == IrOpKind::Inst)
         {
-            build.vmovsd(luauRegValue(vmRegOp(inst.a)), regOp(inst.b));
+            build.vmovsd(valueLhs, regOp(inst.b));
         }
         else
         {
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         }
         break;
+    }
     case IrCmd::STORE_INT:
         if (inst.b.kind == IrOpKind::Constant)
             build.mov(luauRegValueInt(vmRegOp(inst.a)), intOp(inst.b));
         else if (inst.b.kind == IrOpKind::Inst)
             build.mov(luauRegValueInt(vmRegOp(inst.a)), regOp(inst.b));
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         break;
     case IrCmd::STORE_VECTOR:
         storeDoubleAsFloat(luauRegValueVector(vmRegOp(inst.a), 0), inst.b);
         storeDoubleAsFloat(luauRegValueVector(vmRegOp(inst.a), 1), inst.c);
         storeDoubleAsFloat(luauRegValueVector(vmRegOp(inst.a), 2), inst.d);
+
+        if (FFlag::LuauCodeGenVectorDeadStoreElim && inst.e.kind != IrOpKind::None)
+            build.mov(luauRegTag(vmRegOp(inst.a)), tagOp(inst.e));
         break;
     case IrCmd::STORE_TVALUE:
+    {
+        int addrOffset = inst.c.kind != IrOpKind::None ? intOp(inst.c) : 0;
+
         if (inst.a.kind == IrOpKind::VmReg)
             build.vmovups(luauReg(vmRegOp(inst.a)), regOp(inst.b));
         else if (inst.a.kind == IrOpKind::Inst)
-            build.vmovups(xmmword[regOp(inst.a)], regOp(inst.b));
+            build.vmovups(xmmword[regOp(inst.a) + addrOffset], regOp(inst.b));
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         break;
-    case IrCmd::STORE_NODE_VALUE_TV:
-        build.vmovups(luauNodeValue(regOp(inst.a)), regOp(inst.b));
+    }
+    case IrCmd::STORE_SPLIT_TVALUE:
+    {
+        int addrOffset = inst.d.kind != IrOpKind::None ? intOp(inst.d) : 0;
+
+        OperandX64 tagLhs = inst.a.kind == IrOpKind::Inst ? dword[regOp(inst.a) + offsetof(TValue, tt) + addrOffset] : luauRegTag(vmRegOp(inst.a));
+        build.mov(tagLhs, tagOp(inst.b));
+
+        if (tagOp(inst.b) == LUA_TBOOLEAN)
+        {
+            OperandX64 valueLhs =
+                inst.a.kind == IrOpKind::Inst ? dword[regOp(inst.a) + offsetof(TValue, value) + addrOffset] : luauRegValueInt(vmRegOp(inst.a));
+            build.mov(valueLhs, inst.c.kind == IrOpKind::Constant ? OperandX64(intOp(inst.c)) : regOp(inst.c));
+        }
+        else if (tagOp(inst.b) == LUA_TNUMBER)
+        {
+            OperandX64 valueLhs =
+                inst.a.kind == IrOpKind::Inst ? qword[regOp(inst.a) + offsetof(TValue, value) + addrOffset] : luauRegValue(vmRegOp(inst.a));
+
+            if (inst.c.kind == IrOpKind::Constant)
+            {
+                ScopedRegX64 tmp{regs, SizeX64::xmmword};
+
+                build.vmovsd(tmp.reg, build.f64(doubleOp(inst.c)));
+                build.vmovsd(valueLhs, tmp.reg);
+            }
+            else
+            {
+                build.vmovsd(valueLhs, regOp(inst.c));
+            }
+        }
+        else if (isGCO(tagOp(inst.b)))
+        {
+            OperandX64 valueLhs =
+                inst.a.kind == IrOpKind::Inst ? qword[regOp(inst.a) + offsetof(TValue, value) + addrOffset] : luauRegValue(vmRegOp(inst.a));
+            build.mov(valueLhs, regOp(inst.c));
+        }
+        else
+        {
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        }
         break;
+    }
     case IrCmd::ADD_INT:
     {
         inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
@@ -265,7 +385,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         }
         else
         {
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         }
         break;
     }
@@ -338,6 +458,22 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         {
             build.vdivsd(inst.regX64, regOp(inst.a), memRegDoubleOp(inst.b));
         }
+        break;
+    case IrCmd::IDIV_NUM:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a, inst.b});
+
+        if (inst.a.kind == IrOpKind::Constant)
+        {
+            ScopedRegX64 tmp{regs, SizeX64::xmmword};
+
+            build.vmovsd(tmp.reg, memRegDoubleOp(inst.a));
+            build.vdivsd(inst.regX64, tmp.reg, memRegDoubleOp(inst.b));
+        }
+        else
+        {
+            build.vdivsd(inst.regX64, regOp(inst.a), memRegDoubleOp(inst.b));
+        }
+        build.vroundsd(inst.regX64, inst.regX64, inst.regX64, RoundingModeX64::RoundToNegativeInfinity);
         break;
     case IrCmd::MOD_NUM:
     {
@@ -414,18 +550,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
     {
         inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a});
 
-        RegisterX64 src = regOp(inst.a);
-
-        if (inst.regX64 == src)
-        {
-            build.vxorpd(inst.regX64, inst.regX64, build.f64(-0.0));
-        }
-        else
-        {
-            build.vmovsd(inst.regX64, src, src);
-            build.vxorpd(inst.regX64, inst.regX64, build.f64(-0.0));
-        }
-
+        build.vxorpd(inst.regX64, regOp(inst.a), build.f64(-0.0));
         break;
     }
     case IrCmd::FLOOR_NUM:
@@ -472,6 +597,106 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
 
         build.vandpd(inst.regX64, inst.regX64, build.i64(~(1LL << 63)));
         break;
+    case IrCmd::SIGN_NUM:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a});
+
+        ScopedRegX64 tmp0{regs, SizeX64::xmmword};
+        ScopedRegX64 tmp1{regs, SizeX64::xmmword};
+        ScopedRegX64 tmp2{regs, SizeX64::xmmword};
+
+        build.vxorpd(tmp0.reg, tmp0.reg, tmp0.reg);
+
+        // Set tmp1 to -1 if arg < 0, else 0
+        build.vcmpltsd(tmp1.reg, regOp(inst.a), tmp0.reg);
+        build.vmovsd(tmp2.reg, build.f64(-1));
+        build.vandpd(tmp1.reg, tmp1.reg, tmp2.reg);
+
+        // Set mask bit to 1 if 0 < arg, else 0
+        build.vcmpltsd(inst.regX64, tmp0.reg, regOp(inst.a));
+
+        // Result = (mask-bit == 1) ? 1.0 : tmp1
+        // If arg < 0 then tmp1 is -1 and mask-bit is 0, result is -1
+        // If arg == 0 then tmp1 is 0 and mask-bit is 0, result is 0
+        // If arg > 0 then tmp1 is 0 and mask-bit is 1, result is 1
+        build.vblendvpd(inst.regX64, tmp1.reg, build.f64x2(1, 1), inst.regX64);
+        break;
+    }
+    case IrCmd::ADD_VEC:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a, inst.b});
+
+        ScopedRegX64 tmp1{regs};
+        ScopedRegX64 tmp2{regs};
+
+        RegisterX64 tmpa = vecOp(inst.a, tmp1);
+        RegisterX64 tmpb = (inst.a == inst.b) ? tmpa : vecOp(inst.b, tmp2);
+
+        build.vaddps(inst.regX64, tmpa, tmpb);
+        break;
+    }
+    case IrCmd::SUB_VEC:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a, inst.b});
+
+        ScopedRegX64 tmp1{regs};
+        ScopedRegX64 tmp2{regs};
+
+        RegisterX64 tmpa = vecOp(inst.a, tmp1);
+        RegisterX64 tmpb = (inst.a == inst.b) ? tmpa : vecOp(inst.b, tmp2);
+
+        build.vsubps(inst.regX64, tmpa, tmpb);
+        break;
+    }
+    case IrCmd::MUL_VEC:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a, inst.b});
+
+        ScopedRegX64 tmp1{regs};
+        ScopedRegX64 tmp2{regs};
+
+        RegisterX64 tmpa = vecOp(inst.a, tmp1);
+        RegisterX64 tmpb = (inst.a == inst.b) ? tmpa : vecOp(inst.b, tmp2);
+
+        build.vmulps(inst.regX64, tmpa, tmpb);
+        break;
+    }
+    case IrCmd::DIV_VEC:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a, inst.b});
+
+        ScopedRegX64 tmp1{regs};
+        ScopedRegX64 tmp2{regs};
+
+        RegisterX64 tmpa = vecOp(inst.a, tmp1);
+        RegisterX64 tmpb = (inst.a == inst.b) ? tmpa : vecOp(inst.b, tmp2);
+
+        build.vdivps(inst.regX64, tmpa, tmpb);
+        break;
+    }
+    case IrCmd::UNM_VEC:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a});
+
+        build.vxorpd(inst.regX64, regOp(inst.a), build.f32x4(-0.0, -0.0, -0.0, -0.0));
+        break;
+    }
+    case IrCmd::DOT_VEC:
+    {
+        LUAU_ASSERT(FFlag::LuauVectorLibNativeDot);
+
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a, inst.b});
+
+        ScopedRegX64 tmp1{regs};
+        ScopedRegX64 tmp2{regs};
+
+        RegisterX64 tmpa = vecOp(inst.a, tmp1);
+        RegisterX64 tmpb = (inst.a == inst.b) ? tmpa : vecOp(inst.b, tmp2);
+
+        build.vdpps(inst.regX64, tmpa, tmpb, 0x71); // 7 = 0b0111, sum first 3 products into first float
+        build.vcvtss2sd(inst.regX64, inst.regX64, inst.regX64);
+        break;
+    }
     case IrCmd::NOT_ANY:
     {
         // TODO: if we have a single user which is a STORE_INT, we are missing the opportunity to write directly to target
@@ -482,7 +707,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         if (inst.a.kind == IrOpKind::Constant)
         {
             // Other cases should've been constant folded
-            LUAU_ASSERT(tagOp(inst.a) == LUA_TBOOLEAN);
+            CODEGEN_ASSERT(tagOp(inst.a) == LUA_TBOOLEAN);
         }
         else
         {
@@ -493,8 +718,17 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
             build.jcc(ConditionX64::NotEqual, savezero);
         }
 
-        build.cmp(regOp(inst.b), 0);
-        build.jcc(ConditionX64::Equal, saveone);
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            // If value is 1, we fallthrough to storing 0
+            if (intOp(inst.b) == 0)
+                build.jmp(saveone);
+        }
+        else
+        {
+            build.cmp(regOp(inst.b), 0);
+            build.jcc(ConditionX64::Equal, saveone);
+        }
 
         build.setLabel(savezero);
         build.mov(inst.regX64, 0);
@@ -506,8 +740,31 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         build.setLabel(exit);
         break;
     }
+    case IrCmd::CMP_ANY:
+    {
+        IrCondition cond = conditionOp(inst.c);
+
+        IrCallWrapperX64 callWrap(regs, build);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::qword, luauRegAddress(vmRegOp(inst.a)));
+        callWrap.addArgument(SizeX64::qword, luauRegAddress(vmRegOp(inst.b)));
+
+        if (cond == IrCondition::LessEqual)
+            callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaV_lessequal)]);
+        else if (cond == IrCondition::Less)
+            callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaV_lessthan)]);
+        else if (cond == IrCondition::Equal)
+            callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaV_equalval)]);
+        else
+            CODEGEN_ASSERT(!"Unsupported condition");
+
+        emitUpdateBase(build);
+
+        inst.regX64 = regs.takeReg(eax, index);
+        break;
+    }
     case IrCmd::JUMP:
-        jumpOrFallthrough(blockOp(inst.a), next);
+        jumpOrAbortOnUndef(inst.a, next);
         break;
     case IrCmd::JUMP_IF_TRUTHY:
         jumpIfTruthy(build, vmRegOp(inst.a), labelOp(inst.b), labelOp(inst.c));
@@ -519,10 +776,13 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         break;
     case IrCmd::JUMP_EQ_TAG:
     {
-        LUAU_ASSERT(inst.b.kind == IrOpKind::Inst || inst.b.kind == IrOpKind::Constant);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::Inst || inst.b.kind == IrOpKind::Constant);
         OperandX64 opb = inst.b.kind == IrOpKind::Inst ? regOp(inst.b) : OperandX64(tagOp(inst.b));
 
-        build.cmp(memRegTagOp(inst.a), opb);
+        if (inst.a.kind == IrOpKind::Constant)
+            build.cmp(opb, tagOp(inst.a));
+        else
+            build.cmp(memRegTagOp(inst.a), opb);
 
         if (isFallthroughBlock(blockOp(inst.d), next))
         {
@@ -536,24 +796,36 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         }
         break;
     }
-    case IrCmd::JUMP_EQ_INT:
-        build.cmp(regOp(inst.a), intOp(inst.b));
+    case IrCmd::JUMP_CMP_INT:
+    {
+        IrCondition cond = conditionOp(inst.c);
 
-        build.jcc(ConditionX64::Equal, labelOp(inst.c));
-        jumpOrFallthrough(blockOp(inst.d), next);
-        break;
-    case IrCmd::JUMP_LT_INT:
-        build.cmp(regOp(inst.a), intOp(inst.b));
+        if ((cond == IrCondition::Equal || cond == IrCondition::NotEqual) && intOp(inst.b) == 0)
+        {
+            bool invert = cond == IrCondition::NotEqual;
 
-        build.jcc(ConditionX64::Less, labelOp(inst.c));
-        jumpOrFallthrough(blockOp(inst.d), next);
-        break;
-    case IrCmd::JUMP_GE_UINT:
-        build.cmp(regOp(inst.a), unsigned(intOp(inst.b)));
+            build.test(regOp(inst.a), regOp(inst.a));
 
-        build.jcc(ConditionX64::AboveEqual, labelOp(inst.c));
-        jumpOrFallthrough(blockOp(inst.d), next);
+            if (isFallthroughBlock(blockOp(inst.d), next))
+            {
+                build.jcc(invert ? ConditionX64::Zero : ConditionX64::NotZero, labelOp(inst.e));
+                jumpOrFallthrough(blockOp(inst.d), next);
+            }
+            else
+            {
+                build.jcc(invert ? ConditionX64::NotZero : ConditionX64::Zero, labelOp(inst.d));
+                jumpOrFallthrough(blockOp(inst.e), next);
+            }
+        }
+        else
+        {
+            build.cmp(regOp(inst.a), intOp(inst.b));
+
+            build.jcc(getConditionInt(cond), labelOp(inst.d));
+            jumpOrFallthrough(blockOp(inst.e), next);
+        }
         break;
+    }
     case IrCmd::JUMP_EQ_POINTER:
         build.cmp(regOp(inst.a), regOp(inst.b));
 
@@ -566,23 +838,63 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
 
         ScopedRegX64 tmp{regs, SizeX64::xmmword};
 
-        // TODO: jumpOnNumberCmp should work on IrCondition directly
         jumpOnNumberCmp(build, tmp.reg, memRegDoubleOp(inst.a), memRegDoubleOp(inst.b), cond, labelOp(inst.d));
         jumpOrFallthrough(blockOp(inst.e), next);
         break;
     }
-    case IrCmd::JUMP_CMP_ANY:
-        jumpOnAnyCmpFallback(regs, build, vmRegOp(inst.a), vmRegOp(inst.b), conditionOp(inst.c), labelOp(inst.d));
-        jumpOrFallthrough(blockOp(inst.e), next);
+    case IrCmd::JUMP_FORN_LOOP_COND:
+    {
+        ScopedRegX64 tmp1{regs, SizeX64::xmmword};
+        ScopedRegX64 tmp2{regs, SizeX64::xmmword};
+        ScopedRegX64 tmp3{regs, SizeX64::xmmword};
+
+        RegisterX64 index = inst.a.kind == IrOpKind::Inst ? regOp(inst.a) : tmp1.reg;
+        RegisterX64 limit = inst.b.kind == IrOpKind::Inst ? regOp(inst.b) : tmp2.reg;
+
+        if (inst.a.kind != IrOpKind::Inst)
+            build.vmovsd(tmp1.reg, memRegDoubleOp(inst.a));
+
+        if (inst.b.kind != IrOpKind::Inst)
+            build.vmovsd(tmp2.reg, memRegDoubleOp(inst.b));
+
+        Label direct;
+
+        // step > 0
+        jumpOnNumberCmp(build, tmp3.reg, memRegDoubleOp(inst.c), build.f64(0.0), IrCondition::Greater, direct);
+
+        // !(limit <= index)
+        jumpOnNumberCmp(build, noreg, limit, index, IrCondition::NotLessEqual, labelOp(inst.e));
+        build.jmp(labelOp(inst.d));
+
+        // !(index <= limit)
+        build.setLabel(direct);
+        jumpOnNumberCmp(build, noreg, index, limit, IrCondition::NotLessEqual, labelOp(inst.e));
+        jumpOrFallthrough(blockOp(inst.d), next);
         break;
+    }
     case IrCmd::TABLE_LEN:
     {
         IrCallWrapperX64 callWrap(regs, build, index);
         callWrap.addArgument(SizeX64::qword, regOp(inst.a), inst.a);
         callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaH_getn)]);
-
-        inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
-        build.vcvtsi2sd(inst.regX64, inst.regX64, eax);
+        inst.regX64 = regs.takeReg(eax, index);
+        break;
+    }
+    case IrCmd::TABLE_SETNUM:
+    {
+        IrCallWrapperX64 callWrap(regs, build, index);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::qword, regOp(inst.a), inst.a);
+        callWrap.addArgument(SizeX64::dword, regOp(inst.b), inst.b);
+        callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaH_setnum)]);
+        inst.regX64 = regs.takeReg(rax, index);
+        break;
+    }
+    case IrCmd::STRING_LEN:
+    {
+        RegisterX64 ptr = regOp(inst.a);
+        inst.regX64 = regs.allocReg(SizeX64::dword, index);
+        build.mov(inst.regX64, dword[ptr + offsetof(TString, len)]);
         break;
     }
     case IrCmd::NEW_TABLE:
@@ -645,6 +957,16 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         inst.regX64 = regs.takeReg(rax, index);
         break;
     }
+    case IrCmd::NEW_USERDATA:
+    {
+        IrCallWrapperX64 callWrap(regs, build, index);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::qword, intOp(inst.a));
+        callWrap.addArgument(SizeX64::dword, intOp(inst.b));
+        callWrap.call(qword[rNativeContext + offsetof(NativeContext, newUserdata)]);
+        inst.regX64 = regs.takeReg(rax, index);
+        break;
+    }
     case IrCmd::INT_TO_NUM:
         inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
 
@@ -653,7 +975,19 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
     case IrCmd::UINT_TO_NUM:
         inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
 
-        build.vcvtsi2sd(inst.regX64, inst.regX64, qwordReg(regOp(inst.a)));
+        // AVX has no uint->double conversion; the source must come from UINT op and they all should clear top 32 bits so we can usually
+        // use 64-bit reg; the one exception is NUM_TO_UINT which doesn't clear top bits
+        if (IrCmd source = function.instOp(inst.a).cmd; source == IrCmd::NUM_TO_UINT)
+        {
+            ScopedRegX64 tmp{regs, SizeX64::dword};
+            build.mov(tmp.reg, regOp(inst.a));
+            build.vcvtsi2sd(inst.regX64, inst.regX64, qwordReg(tmp.reg));
+        }
+        else
+        {
+            CODEGEN_ASSERT(source != IrCmd::SUBSTITUTE); // we don't process substitutions
+            build.vcvtsi2sd(inst.regX64, inst.regX64, qwordReg(regOp(inst.a)));
+        }
         break;
     case IrCmd::NUM_TO_INT:
         inst.regX64 = regs.allocReg(SizeX64::dword, index);
@@ -664,6 +998,29 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         inst.regX64 = regs.allocReg(SizeX64::dword, index);
 
         build.vcvttsd2si(qwordReg(inst.regX64), memRegDoubleOp(inst.a));
+        break;
+    case IrCmd::NUM_TO_VEC:
+        inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
+
+        if (inst.a.kind == IrOpKind::Constant)
+        {
+            float value = float(doubleOp(inst.a));
+            uint32_t asU32;
+            static_assert(sizeof(asU32) == sizeof(value), "Expecting float to be 32-bit");
+            memcpy(&asU32, &value, sizeof(value));
+
+            build.vmovaps(inst.regX64, build.u32x4(asU32, asU32, asU32, 0));
+        }
+        else
+        {
+            build.vcvtsd2ss(inst.regX64, inst.regX64, memRegDoubleOp(inst.a));
+            build.vpshufps(inst.regX64, inst.regX64, inst.regX64, 0b00'00'00'00);
+        }
+        break;
+    case IrCmd::TAG_VECTOR:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::xmmword, index, {inst.a});
+
+        build.vpinsrd(inst.regX64, regOp(inst.a), build.i32(LUA_TVECTOR), 3);
         break;
     case IrCmd::ADJUST_STACK_TO_REG:
     {
@@ -683,7 +1040,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         }
         else
         {
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         }
         break;
     }
@@ -698,9 +1055,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
 
     case IrCmd::FASTCALL:
     {
-        OperandX64 arg2 = inst.d.kind != IrOpKind::Undef ? memRegDoubleOp(inst.d) : OperandX64{0};
-
-        emitBuiltin(regs, build, uintOp(inst.a), vmRegOp(inst.b), vmRegOp(inst.c), arg2, intOp(inst.e), intOp(inst.f));
+        emitBuiltin(regs, build, uintOp(inst.a), vmRegOp(inst.b), vmRegOp(inst.c), intOp(inst.d));
         break;
     }
     case IrCmd::INVOKE_FASTCALL:
@@ -708,28 +1063,49 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         unsigned bfid = uintOp(inst.a);
 
         OperandX64 args = 0;
+        ScopedRegX64 argsAlt{regs};
 
-        if (inst.d.kind == IrOpKind::VmReg)
-            args = luauRegAddress(vmRegOp(inst.d));
-        else if (inst.d.kind == IrOpKind::VmConst)
-            args = luauConstantAddress(vmConstOp(inst.d));
+        // 'E' argument can only be produced by LOP_FASTCALL3
+        if (inst.e.kind != IrOpKind::Undef)
+        {
+            CODEGEN_ASSERT(intOp(inst.f) == 3);
+
+            ScopedRegX64 tmp{regs, SizeX64::xmmword};
+            argsAlt.alloc(SizeX64::qword);
+
+            build.mov(argsAlt.reg, qword[rState + offsetof(lua_State, top)]);
+
+            build.vmovups(tmp.reg, luauReg(vmRegOp(inst.d)));
+            build.vmovups(xmmword[argsAlt.reg], tmp.reg);
+
+            build.vmovups(tmp.reg, luauReg(vmRegOp(inst.e)));
+            build.vmovups(xmmword[argsAlt.reg + sizeof(TValue)], tmp.reg);
+        }
         else
-            LUAU_ASSERT(inst.d.kind == IrOpKind::Undef);
+        {
+            if (inst.d.kind == IrOpKind::VmReg)
+                args = luauRegAddress(vmRegOp(inst.d));
+            else if (inst.d.kind == IrOpKind::VmConst)
+                args = luauConstantAddress(vmConstOp(inst.d));
+            else
+                CODEGEN_ASSERT(inst.d.kind == IrOpKind::Undef);
+        }
 
         int ra = vmRegOp(inst.b);
         int arg = vmRegOp(inst.c);
-        int nparams = intOp(inst.e);
-        int nresults = intOp(inst.f);
-
-        ScopedRegX64 func{regs, SizeX64::qword};
-        build.mov(func.reg, qword[rNativeContext + offsetof(NativeContext, luauF_table) + bfid * sizeof(luau_FastFunction)]);
+        int nparams = intOp(inst.f);
+        int nresults = intOp(inst.g);
 
         IrCallWrapperX64 callWrap(regs, build, index);
         callWrap.addArgument(SizeX64::qword, rState);
         callWrap.addArgument(SizeX64::qword, luauRegAddress(ra));
         callWrap.addArgument(SizeX64::qword, luauRegAddress(arg));
         callWrap.addArgument(SizeX64::dword, nresults);
-        callWrap.addArgument(SizeX64::qword, args);
+
+        if (inst.e.kind != IrOpKind::Undef)
+            callWrap.addArgument(SizeX64::qword, argsAlt);
+        else
+            callWrap.addArgument(SizeX64::qword, args);
 
         if (nparams == LUA_MULTRET)
         {
@@ -749,6 +1125,9 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
             callWrap.addArgument(SizeX64::dword, nparams);
         }
 
+        ScopedRegX64 func{regs, SizeX64::qword};
+        build.mov(func.reg, qword[rNativeContext + offsetof(NativeContext, luauF_table) + bfid * sizeof(luau_FastFunction)]);
+
         callWrap.call(func.release());
         inst.regX64 = regs.takeReg(eax, index); // Result of a builtin call is returned in eax
         break;
@@ -762,11 +1141,12 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         break;
     }
     case IrCmd::DO_ARITH:
-        if (inst.c.kind == IrOpKind::VmReg)
-            callArithHelper(regs, build, vmRegOp(inst.a), vmRegOp(inst.b), luauRegAddress(vmRegOp(inst.c)), TMS(intOp(inst.d)));
-        else
-            callArithHelper(regs, build, vmRegOp(inst.a), vmRegOp(inst.b), luauConstantAddress(vmConstOp(inst.c)), TMS(intOp(inst.d)));
+    {
+        OperandX64 opb = inst.b.kind == IrOpKind::VmReg ? luauRegAddress(vmRegOp(inst.b)) : luauConstantAddress(vmConstOp(inst.b));
+        OperandX64 opc = inst.c.kind == IrOpKind::VmReg ? luauRegAddress(vmRegOp(inst.c)) : luauConstantAddress(vmConstOp(inst.c));
+        callArithHelper(regs, build, vmRegOp(inst.a), opb, opc, TMS(intOp(inst.d)));
         break;
+    }
     case IrCmd::DO_LEN:
         callLengthHelper(regs, build, vmRegOp(inst.a), vmRegOp(inst.b));
         break;
@@ -783,7 +1163,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         }
         else
         {
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         }
         break;
     case IrCmd::SET_TABLE:
@@ -799,7 +1179,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         }
         else
         {
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
         }
         break;
     case IrCmd::GET_IMPORT:
@@ -872,23 +1252,55 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
 
         tmp1.free();
 
-        callBarrierObject(regs, build, tmp2.release(), {}, vmRegOp(inst.b));
+        if (inst.c.kind == IrOpKind::Undef || isGCO(tagOp(inst.c)))
+            callBarrierObject(regs, build, tmp2.release(), {}, inst.b, inst.c.kind == IrOpKind::Undef ? -1 : tagOp(inst.c));
         break;
     }
-    case IrCmd::PREPARE_FORN:
-        callPrepareForN(regs, build, vmRegOp(inst.a), vmRegOp(inst.b), vmRegOp(inst.c));
-        break;
     case IrCmd::CHECK_TAG:
         build.cmp(memRegTagOp(inst.a), tagOp(inst.b));
-        jumpOrAbortOnUndef(ConditionX64::NotEqual, ConditionX64::Equal, inst.c);
+        jumpOrAbortOnUndef(ConditionX64::NotEqual, inst.c, next);
         break;
+    case IrCmd::CHECK_TRUTHY:
+    {
+        // Constant tags which don't require boolean value check should've been removed in constant folding
+        CODEGEN_ASSERT(inst.a.kind != IrOpKind::Constant || tagOp(inst.a) == LUA_TBOOLEAN);
+
+        Label skip;
+
+        if (inst.a.kind != IrOpKind::Constant)
+        {
+            // Fail to fallback on 'nil' (falsy)
+            build.cmp(memRegTagOp(inst.a), LUA_TNIL);
+            jumpOrAbortOnUndef(ConditionX64::Equal, inst.c, next);
+
+            // Skip value test if it's not a boolean (truthy)
+            build.cmp(memRegTagOp(inst.a), LUA_TBOOLEAN);
+            build.jcc(ConditionX64::NotEqual, skip);
+        }
+
+        // fail to fallback on 'false' boolean value (falsy)
+        if (inst.b.kind != IrOpKind::Constant)
+        {
+            build.cmp(memRegUintOp(inst.b), 0);
+            jumpOrAbortOnUndef(ConditionX64::Equal, inst.c, next);
+        }
+        else
+        {
+            if (intOp(inst.b) == 0)
+                jumpOrAbortOnUndef(inst.c, next);
+        }
+
+        if (inst.a.kind != IrOpKind::Constant)
+            build.setLabel(skip);
+        break;
+    }
     case IrCmd::CHECK_READONLY:
         build.cmp(byte[regOp(inst.a) + offsetof(Table, readonly)], 0);
-        jumpOrAbortOnUndef(ConditionX64::NotEqual, ConditionX64::Equal, inst.b);
+        jumpOrAbortOnUndef(ConditionX64::NotEqual, inst.b, next);
         break;
     case IrCmd::CHECK_NO_METATABLE:
         build.cmp(qword[regOp(inst.a) + offsetof(Table, metatable)], 0);
-        jumpOrAbortOnUndef(ConditionX64::NotEqual, ConditionX64::Equal, inst.b);
+        jumpOrAbortOnUndef(ConditionX64::NotEqual, inst.b, next);
         break;
     case IrCmd::CHECK_SAFE_ENV:
     {
@@ -897,7 +1309,8 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         build.mov(tmp.reg, sClosure);
         build.mov(tmp.reg, qword[tmp.reg + offsetof(Closure, env)]);
         build.cmp(byte[tmp.reg + offsetof(Table, safeenv)], 0);
-        jumpOrAbortOnUndef(ConditionX64::Equal, ConditionX64::NotEqual, inst.a);
+
+        jumpOrAbortOnUndef(ConditionX64::Equal, inst.a, next);
         break;
     }
     case IrCmd::CHECK_ARRAY_SIZE:
@@ -906,9 +1319,9 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         else if (inst.b.kind == IrOpKind::Constant)
             build.cmp(dword[regOp(inst.a) + offsetof(Table, sizearray)], intOp(inst.b));
         else
-            LUAU_ASSERT(!"Unsupported instruction form");
+            CODEGEN_ASSERT(!"Unsupported instruction form");
 
-        jumpOrAbortOnUndef(ConditionX64::BelowEqual, ConditionX64::NotBelowEqual, inst.c);
+        jumpOrAbortOnUndef(ConditionX64::BelowEqual, inst.c, next);
         break;
     case IrCmd::JUMP_SLOT_MATCH:
     case IrCmd::CHECK_SLOT_MATCH:
@@ -954,17 +1367,106 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
 
         build.mov(tmp.reg, dword[regOp(inst.a) + offsetof(LuaNode, key) + kOffsetOfTKeyTagNext]);
         build.shr(tmp.reg, kTKeyTagBits);
-        jumpOrAbortOnUndef(ConditionX64::NotZero, ConditionX64::Zero, inst.b);
+        jumpOrAbortOnUndef(ConditionX64::NotZero, inst.b, next);
+        break;
+    }
+    case IrCmd::CHECK_NODE_VALUE:
+    {
+        build.cmp(dword[regOp(inst.a) + offsetof(LuaNode, val) + offsetof(TValue, tt)], LUA_TNIL);
+        jumpOrAbortOnUndef(ConditionX64::Equal, inst.b, next);
+        break;
+    }
+    case IrCmd::CHECK_BUFFER_LEN:
+    {
+        int accessSize = intOp(inst.c);
+        CODEGEN_ASSERT(accessSize > 0);
+
+        if (inst.b.kind == IrOpKind::Inst)
+        {
+            if (accessSize == 1)
+            {
+                // Simpler check for a single byte access
+                build.cmp(dword[regOp(inst.a) + offsetof(Buffer, len)], regOp(inst.b));
+                jumpOrAbortOnUndef(ConditionX64::BelowEqual, inst.d, next);
+            }
+            else
+            {
+                ScopedRegX64 tmp1{regs, SizeX64::qword};
+                ScopedRegX64 tmp2{regs, SizeX64::dword};
+
+                // To perform the bounds check using a single branch, we take index that is limited to 32 bit int
+                // Access size is then added using a 64 bit addition
+                // This will make sure that addition will not wrap around for values like 0xffffffff
+
+                if (IrCmd source = function.instOp(inst.b).cmd; source == IrCmd::NUM_TO_INT)
+                {
+                    // When previous operation is a conversion to an integer (common case), it is guaranteed to have high register bits cleared
+                    build.lea(tmp1.reg, addr[qwordReg(regOp(inst.b)) + accessSize]);
+                }
+                else
+                {
+                    // When the source of the index is unknown, it could contain garbage in the high bits, so we zero-extend it explicitly
+                    build.mov(dwordReg(tmp1.reg), regOp(inst.b));
+                    build.add(tmp1.reg, accessSize);
+                }
+
+                build.mov(tmp2.reg, dword[regOp(inst.a) + offsetof(Buffer, len)]);
+                build.cmp(qwordReg(tmp2.reg), tmp1.reg);
+
+                jumpOrAbortOnUndef(ConditionX64::Below, inst.d, next);
+            }
+        }
+        else if (inst.b.kind == IrOpKind::Constant)
+        {
+            int offset = intOp(inst.b);
+
+            // Constant folding can take care of it, but for safety we avoid overflow/underflow cases here
+            if (offset < 0 || unsigned(offset) + unsigned(accessSize) >= unsigned(INT_MAX))
+                jumpOrAbortOnUndef(inst.d, next);
+            else
+                build.cmp(dword[regOp(inst.a) + offsetof(Buffer, len)], offset + accessSize);
+
+            jumpOrAbortOnUndef(ConditionX64::Below, inst.d, next);
+        }
+        else
+        {
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        }
+        break;
+    }
+    case IrCmd::CHECK_USERDATA_TAG:
+    {
+        build.cmp(byte[regOp(inst.a) + offsetof(Udata, tag)], intOp(inst.b));
+        jumpOrAbortOnUndef(ConditionX64::NotEqual, inst.c, next);
         break;
     }
     case IrCmd::INTERRUPT:
-        emitInterrupt(regs, build, uintOp(inst.a));
+    {
+        unsigned pcpos = uintOp(inst.a);
+
+        // We unconditionally spill values here because that allows us to ignore register state when we synthesize interrupt handler
+        // This can be changed in the future if we can somehow record interrupt handler code separately
+        // Since interrupts are loop edges or call/ret, we don't have a significant opportunity for register reuse here anyway
+        regs.preserveAndFreeInstValues();
+
+        ScopedRegX64 tmp{regs, SizeX64::qword};
+
+        Label self;
+
+        build.mov(tmp.reg, qword[rState + offsetof(lua_State, global)]);
+        build.cmp(qword[tmp.reg + offsetof(global_State, cb.interrupt)], 0);
+        build.jcc(ConditionX64::NotEqual, self);
+
+        Label next = build.setLabel();
+
+        interruptHandlers.push_back({self, pcpos, next});
         break;
+    }
     case IrCmd::CHECK_GC:
         callStepGc(regs, build);
         break;
     case IrCmd::BARRIER_OBJ:
-        callBarrierObject(regs, build, regOp(inst.a), inst.a, vmRegOp(inst.b));
+        callBarrierObject(regs, build, regOp(inst.a), inst.a, inst.b, inst.c.kind == IrOpKind::Undef ? -1 : tagOp(inst.c));
         break;
     case IrCmd::BARRIER_TABLE_BACK:
         callBarrierTableFast(regs, build, regOp(inst.a), inst.a);
@@ -974,7 +1476,8 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         Label skip;
 
         ScopedRegX64 tmp{regs, SizeX64::qword};
-        checkObjectBarrierConditions(build, tmp.reg, regOp(inst.a), vmRegOp(inst.b), skip);
+
+        checkObjectBarrierConditions(build, tmp.reg, regOp(inst.a), inst.b, inst.c.kind == IrOpKind::Undef ? -1 : tagOp(inst.c), skip);
 
         {
             ScopedSpills spillGuard(regs);
@@ -991,7 +1494,6 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
     }
     case IrCmd::SET_SAVEDPC:
     {
-        // This is like emitSetSavedPc, but using register allocation instead of relying on rax/rdx
         ScopedRegX64 tmp1{regs, SizeX64::qword};
         ScopedRegX64 tmp2{regs, SizeX64::qword};
 
@@ -1038,7 +1540,9 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         // Fallbacks to non-IR instruction implementations
     case IrCmd::SETLIST:
         regs.assertAllFree();
-        emitInstSetList(regs, build, vmRegOp(inst.b), vmRegOp(inst.c), intOp(inst.d), uintOp(inst.e));
+        emitInstSetList(
+            regs, build, vmRegOp(inst.b), vmRegOp(inst.c), intOp(inst.d), uintOp(inst.e), inst.f.kind == IrOpKind::Undef ? -1 : int(uintOp(inst.f))
+        );
         break;
     case IrCmd::CALL:
         regs.assertAllFree();
@@ -1048,7 +1552,7 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
     case IrCmd::RETURN:
         regs.assertAllFree();
         regs.assertNoSpills();
-        emitInstReturn(build, helpers, vmRegOp(inst.a), intOp(inst.b));
+        emitInstReturn(build, helpers, vmRegOp(inst.a), intOp(inst.b), function.variadic);
         break;
     case IrCmd::FORGLOOP:
         regs.assertAllFree();
@@ -1109,58 +1613,94 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
 
         // Full instruction fallbacks
     case IrCmd::FALLBACK_GETGLOBAL:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::VmConst);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::VmConst);
 
         emitFallback(regs, build, offsetof(NativeContext, executeGETGLOBAL), uintOp(inst.a));
         break;
     case IrCmd::FALLBACK_SETGLOBAL:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::VmConst);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::VmConst);
 
         emitFallback(regs, build, offsetof(NativeContext, executeSETGLOBAL), uintOp(inst.a));
         break;
     case IrCmd::FALLBACK_GETTABLEKS:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.d.kind == IrOpKind::VmConst);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.d.kind == IrOpKind::VmConst);
 
         emitFallback(regs, build, offsetof(NativeContext, executeGETTABLEKS), uintOp(inst.a));
         break;
     case IrCmd::FALLBACK_SETTABLEKS:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.d.kind == IrOpKind::VmConst);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.d.kind == IrOpKind::VmConst);
 
         emitFallback(regs, build, offsetof(NativeContext, executeSETTABLEKS), uintOp(inst.a));
         break;
     case IrCmd::FALLBACK_NAMECALL:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.d.kind == IrOpKind::VmConst);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.d.kind == IrOpKind::VmConst);
 
         emitFallback(regs, build, offsetof(NativeContext, executeNAMECALL), uintOp(inst.a));
         break;
     case IrCmd::FALLBACK_PREPVARARGS:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::Constant);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::Constant);
 
         emitFallback(regs, build, offsetof(NativeContext, executePREPVARARGS), uintOp(inst.a));
         break;
     case IrCmd::FALLBACK_GETVARARGS:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::Constant);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::Constant);
 
-        emitFallback(regs, build, offsetof(NativeContext, executeGETVARARGS), uintOp(inst.a));
-        break;
-    case IrCmd::FALLBACK_NEWCLOSURE:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::Constant);
+        if (intOp(inst.c) == LUA_MULTRET)
+        {
+            IrCallWrapperX64 callWrap(regs, build);
+            callWrap.addArgument(SizeX64::qword, rState);
 
-        emitFallback(regs, build, offsetof(NativeContext, executeNEWCLOSURE), uintOp(inst.a));
+            RegisterX64 reg = callWrap.suggestNextArgumentRegister(SizeX64::qword);
+            build.mov(reg, sCode);
+            callWrap.addArgument(SizeX64::qword, addr[reg + uintOp(inst.a) * sizeof(Instruction)]);
+
+            callWrap.addArgument(SizeX64::qword, rBase);
+            callWrap.addArgument(SizeX64::dword, vmRegOp(inst.b));
+            callWrap.call(qword[rNativeContext + offsetof(NativeContext, executeGETVARARGSMultRet)]);
+
+            emitUpdateBase(build);
+        }
+        else
+        {
+            IrCallWrapperX64 callWrap(regs, build);
+            callWrap.addArgument(SizeX64::qword, rState);
+            callWrap.addArgument(SizeX64::qword, rBase);
+            callWrap.addArgument(SizeX64::dword, vmRegOp(inst.b));
+            callWrap.addArgument(SizeX64::dword, intOp(inst.c));
+            callWrap.call(qword[rNativeContext + offsetof(NativeContext, executeGETVARARGSConst)]);
+        }
         break;
+    case IrCmd::NEWCLOSURE:
+    {
+        ScopedRegX64 tmp2{regs, SizeX64::qword};
+        build.mov(tmp2.reg, sClosure);
+        build.mov(tmp2.reg, qword[tmp2.reg + offsetof(Closure, l.p)]);
+        build.mov(tmp2.reg, qword[tmp2.reg + offsetof(Proto, p)]);
+        build.mov(tmp2.reg, qword[tmp2.reg + sizeof(Proto*) * uintOp(inst.c)]);
+
+        IrCallWrapperX64 callWrap(regs, build, index);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::dword, uintOp(inst.a), inst.a);
+        callWrap.addArgument(SizeX64::qword, regOp(inst.b), inst.b);
+        callWrap.addArgument(SizeX64::qword, tmp2);
+
+        callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaF_newLclosure)]);
+
+        inst.regX64 = regs.takeReg(rax, index);
+        break;
+    }
     case IrCmd::FALLBACK_DUPCLOSURE:
-        LUAU_ASSERT(inst.b.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(inst.c.kind == IrOpKind::VmConst);
+        CODEGEN_ASSERT(inst.b.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(inst.c.kind == IrOpKind::VmConst);
 
         emitFallback(regs, build, offsetof(NativeContext, executeDUPCLOSURE), uintOp(inst.a));
         break;
@@ -1202,77 +1742,142 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         break;
     case IrCmd::BITLSHIFT_UINT:
     {
+        ScopedRegX64 shiftTmp{regs};
+
         // Custom bit shift value can only be placed in cl
-        ScopedRegX64 shiftTmp{regs, regs.takeReg(ecx, kInvalidInstIdx)};
+        // but we use it if the shift value is not a constant stored in b
+        if (inst.b.kind != IrOpKind::Constant)
+            shiftTmp.take(ecx);
 
-        inst.regX64 = regs.allocReg(SizeX64::dword, index);
-
-        build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
 
         if (inst.a.kind != IrOpKind::Inst || inst.regX64 != regOp(inst.a))
             build.mov(inst.regX64, memRegUintOp(inst.a));
 
-        build.shl(inst.regX64, byteReg(shiftTmp.reg));
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            // if shift value is a constant, we extract the byte-sized shift amount
+            int8_t shift = int8_t(unsigned(intOp(inst.b)));
+            build.shl(inst.regX64, shift);
+        }
+        else
+        {
+            build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+            build.shl(inst.regX64, byteReg(shiftTmp.reg));
+        }
+
         break;
     }
     case IrCmd::BITRSHIFT_UINT:
     {
+        ScopedRegX64 shiftTmp{regs};
+
         // Custom bit shift value can only be placed in cl
-        ScopedRegX64 shiftTmp{regs, regs.takeReg(ecx, kInvalidInstIdx)};
+        // but we use it if the shift value is not a constant stored in b
+        if (inst.b.kind != IrOpKind::Constant)
+            shiftTmp.take(ecx);
 
-        inst.regX64 = regs.allocReg(SizeX64::dword, index);
-
-        build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
 
         if (inst.a.kind != IrOpKind::Inst || inst.regX64 != regOp(inst.a))
             build.mov(inst.regX64, memRegUintOp(inst.a));
 
-        build.shr(inst.regX64, byteReg(shiftTmp.reg));
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            // if shift value is a constant, we extract the byte-sized shift amount
+            int8_t shift = int8_t(unsigned(intOp(inst.b)));
+            build.shr(inst.regX64, shift);
+        }
+        else
+        {
+            build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+            build.shr(inst.regX64, byteReg(shiftTmp.reg));
+        }
+
         break;
     }
     case IrCmd::BITARSHIFT_UINT:
     {
+        ScopedRegX64 shiftTmp{regs};
+
         // Custom bit shift value can only be placed in cl
-        ScopedRegX64 shiftTmp{regs, regs.takeReg(ecx, kInvalidInstIdx)};
+        // but we use it if the shift value is not a constant stored in b
+        if (inst.b.kind != IrOpKind::Constant)
+            shiftTmp.take(ecx);
 
-        inst.regX64 = regs.allocReg(SizeX64::dword, index);
-
-        build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
 
         if (inst.a.kind != IrOpKind::Inst || inst.regX64 != regOp(inst.a))
             build.mov(inst.regX64, memRegUintOp(inst.a));
 
-        build.sar(inst.regX64, byteReg(shiftTmp.reg));
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            // if shift value is a constant, we extract the byte-sized shift amount
+            int8_t shift = int8_t(unsigned(intOp(inst.b)));
+            build.sar(inst.regX64, shift);
+        }
+        else
+        {
+            build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+            build.sar(inst.regX64, byteReg(shiftTmp.reg));
+        }
+
         break;
     }
     case IrCmd::BITLROTATE_UINT:
     {
+        ScopedRegX64 shiftTmp{regs};
+
         // Custom bit shift value can only be placed in cl
-        ScopedRegX64 shiftTmp{regs, regs.takeReg(ecx, kInvalidInstIdx)};
+        // but we use it if the shift value is not a constant stored in b
+        if (inst.b.kind != IrOpKind::Constant)
+            shiftTmp.take(ecx);
 
-        inst.regX64 = regs.allocReg(SizeX64::dword, index);
-
-        build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
 
         if (inst.a.kind != IrOpKind::Inst || inst.regX64 != regOp(inst.a))
             build.mov(inst.regX64, memRegUintOp(inst.a));
 
-        build.rol(inst.regX64, byteReg(shiftTmp.reg));
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            // if shift value is a constant, we extract the byte-sized shift amount
+            int8_t shift = int8_t(unsigned(intOp(inst.b)));
+            build.rol(inst.regX64, shift);
+        }
+        else
+        {
+            build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+            build.rol(inst.regX64, byteReg(shiftTmp.reg));
+        }
+
         break;
     }
     case IrCmd::BITRROTATE_UINT:
     {
+        ScopedRegX64 shiftTmp{regs};
+
         // Custom bit shift value can only be placed in cl
-        ScopedRegX64 shiftTmp{regs, regs.takeReg(ecx, kInvalidInstIdx)};
+        // but we use it if the shift value is not a constant stored in b
+        if (inst.b.kind != IrOpKind::Constant)
+            shiftTmp.take(ecx);
 
-        inst.regX64 = regs.allocReg(SizeX64::dword, index);
-
-        build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
 
         if (inst.a.kind != IrOpKind::Inst || inst.regX64 != regOp(inst.a))
             build.mov(inst.regX64, memRegUintOp(inst.a));
 
-        build.ror(inst.regX64, byteReg(shiftTmp.reg));
+        if (inst.b.kind == IrOpKind::Constant)
+        {
+            // if shift value is a constant, we extract the byte-sized shift amount
+            int8_t shift = int8_t(unsigned(intOp(inst.b)));
+            build.ror(inst.regX64, shift);
+        }
+        else
+        {
+            build.mov(shiftTmp.reg, memRegUintOp(inst.b));
+            build.ror(inst.regX64, byteReg(shiftTmp.reg));
+        }
+
         break;
     }
     case IrCmd::BITCOUNTLZ_UINT:
@@ -1312,6 +1917,16 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         build.setLabel(exit);
         break;
     }
+    case IrCmd::BYTESWAP_UINT:
+    {
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a});
+
+        if (inst.a.kind != IrOpKind::Inst || inst.regX64 != regOp(inst.a))
+            build.mov(inst.regX64, memRegUintOp(inst.a));
+
+        build.bswap(inst.regX64);
+        break;
+    }
     case IrCmd::INVOKE_LIBM:
     {
         IrCallWrapperX64 callWrap(regs, build, index);
@@ -1332,11 +1947,133 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
         inst.regX64 = regs.takeReg(xmm0, index);
         break;
     }
+    case IrCmd::GET_TYPE:
+    {
+        inst.regX64 = regs.allocReg(SizeX64::qword, index);
+
+        build.mov(inst.regX64, qword[rState + offsetof(lua_State, global)]);
+
+        if (inst.a.kind == IrOpKind::Inst)
+            build.mov(inst.regX64, qword[inst.regX64 + qwordReg(regOp(inst.a)) * sizeof(TString*) + offsetof(global_State, ttname)]);
+        else if (inst.a.kind == IrOpKind::Constant)
+            build.mov(inst.regX64, qword[inst.regX64 + tagOp(inst.a) * sizeof(TString*) + offsetof(global_State, ttname)]);
+        else
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        break;
+    }
+    case IrCmd::GET_TYPEOF:
+    {
+        IrCallWrapperX64 callWrap(regs, build);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::qword, luauRegAddress(vmRegOp(inst.a)));
+        callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaT_objtypenamestr)]);
+
+        inst.regX64 = regs.takeReg(rax, index);
+        break;
+    }
+
+    case IrCmd::FINDUPVAL:
+    {
+        IrCallWrapperX64 callWrap(regs, build);
+        callWrap.addArgument(SizeX64::qword, rState);
+        callWrap.addArgument(SizeX64::qword, luauRegAddress(vmRegOp(inst.a)));
+        callWrap.call(qword[rNativeContext + offsetof(NativeContext, luaF_findupval)]);
+
+        inst.regX64 = regs.takeReg(rax, index);
+        break;
+    }
+
+    case IrCmd::BUFFER_READI8:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a, inst.b});
+
+        build.movsx(inst.regX64, byte[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_READU8:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a, inst.b});
+
+        build.movzx(inst.regX64, byte[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_WRITEI8:
+    {
+        OperandX64 value = inst.c.kind == IrOpKind::Inst ? byteReg(regOp(inst.c)) : OperandX64(int8_t(intOp(inst.c)));
+
+        build.mov(byte[bufferAddrOp(inst.a, inst.b, inst.d.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.d))], value);
+        break;
+    }
+
+    case IrCmd::BUFFER_READI16:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a, inst.b});
+
+        build.movsx(inst.regX64, word[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_READU16:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a, inst.b});
+
+        build.movzx(inst.regX64, word[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_WRITEI16:
+    {
+        OperandX64 value = inst.c.kind == IrOpKind::Inst ? wordReg(regOp(inst.c)) : OperandX64(int16_t(intOp(inst.c)));
+
+        build.mov(word[bufferAddrOp(inst.a, inst.b, inst.d.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.d))], value);
+        break;
+    }
+
+    case IrCmd::BUFFER_READI32:
+        inst.regX64 = regs.allocRegOrReuse(SizeX64::dword, index, {inst.a, inst.b});
+
+        build.mov(inst.regX64, dword[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_WRITEI32:
+    {
+        OperandX64 value = inst.c.kind == IrOpKind::Inst ? regOp(inst.c) : OperandX64(intOp(inst.c));
+
+        build.mov(dword[bufferAddrOp(inst.a, inst.b, inst.d.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.d))], value);
+        break;
+    }
+
+    case IrCmd::BUFFER_READF32:
+        inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
+
+        build.vcvtss2sd(inst.regX64, inst.regX64, dword[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_WRITEF32:
+        storeDoubleAsFloat(dword[bufferAddrOp(inst.a, inst.b, inst.d.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.d))], inst.c);
+        break;
+
+    case IrCmd::BUFFER_READF64:
+        inst.regX64 = regs.allocReg(SizeX64::xmmword, index);
+
+        build.vmovsd(inst.regX64, qword[bufferAddrOp(inst.a, inst.b, inst.c.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.c))]);
+        break;
+
+    case IrCmd::BUFFER_WRITEF64:
+        if (inst.c.kind == IrOpKind::Constant)
+        {
+            ScopedRegX64 tmp{regs, SizeX64::xmmword};
+            build.vmovsd(tmp.reg, build.f64(doubleOp(inst.c)));
+            build.vmovsd(qword[bufferAddrOp(inst.a, inst.b, inst.d.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.d))], tmp.reg);
+        }
+        else if (inst.c.kind == IrOpKind::Inst)
+        {
+            build.vmovsd(qword[bufferAddrOp(inst.a, inst.b, inst.d.kind == IrOpKind::None ? LUA_TBUFFER : tagOp(inst.d))], regOp(inst.c));
+        }
+        else
+        {
+            CODEGEN_ASSERT(!"Unsupported instruction form");
+        }
+        break;
 
     // Pseudo instructions
     case IrCmd::NOP:
     case IrCmd::SUBSTITUTE:
-        LUAU_ASSERT(!"Pseudo instructions should not be lowered");
+        CODEGEN_ASSERT(!"Pseudo instructions should not be lowered");
         break;
     }
 
@@ -1345,9 +2082,53 @@ void IrLoweringX64::lowerInst(IrInst& inst, uint32_t index, IrBlock& next)
     regs.freeLastUseRegs(inst, index);
 }
 
-void IrLoweringX64::finishBlock()
+void IrLoweringX64::finishBlock(const IrBlock& curr, const IrBlock& next)
 {
-    regs.assertNoSpills();
+    if (!regs.spills.empty())
+    {
+        // If we have spills remaining, we have to immediately lower the successor block
+        for (uint32_t predIdx : predecessors(function.cfg, function.getBlockIndex(next)))
+            CODEGEN_ASSERT(predIdx == function.getBlockIndex(curr) || function.blocks[predIdx].kind == IrBlockKind::Dead);
+
+        // And the next block cannot be a join block in cfg
+        CODEGEN_ASSERT(next.useCount == 1);
+    }
+}
+
+void IrLoweringX64::finishFunction()
+{
+    if (build.logText)
+        build.logAppend("; interrupt handlers\n");
+
+    for (InterruptHandler& handler : interruptHandlers)
+    {
+        build.setLabel(handler.self);
+        build.mov(eax, handler.pcpos + 1);
+        build.lea(rbx, handler.next);
+        build.jmp(helpers.interrupt);
+    }
+
+    if (build.logText)
+        build.logAppend("; exit handlers\n");
+
+    for (ExitHandler& handler : exitHandlers)
+    {
+        CODEGEN_ASSERT(handler.pcpos != kVmExitEntryGuardPc);
+
+        build.setLabel(handler.self);
+
+        build.mov(edx, handler.pcpos * sizeof(Instruction));
+        build.jmp(helpers.updatePcAndContinueInVm);
+    }
+
+    if (stats)
+    {
+        if (regs.maxUsedSlot > kSpillSlots)
+            stats->regAllocErrors++;
+
+        if (regs.maxUsedSlot > stats->maxSpillSlotsUsed)
+            stats->maxSpillSlotsUsed = regs.maxUsedSlot;
+    }
 }
 
 bool IrLoweringX64::hasError() const
@@ -1359,30 +2140,81 @@ bool IrLoweringX64::hasError() const
     return false;
 }
 
-bool IrLoweringX64::isFallthroughBlock(IrBlock target, IrBlock next)
+bool IrLoweringX64::isFallthroughBlock(const IrBlock& target, const IrBlock& next)
 {
     return target.start == next.start;
 }
 
-void IrLoweringX64::jumpOrFallthrough(IrBlock& target, IrBlock& next)
+Label& IrLoweringX64::getTargetLabel(IrOp op, Label& fresh)
+{
+    if (op.kind == IrOpKind::Undef)
+        return fresh;
+
+    if (op.kind == IrOpKind::VmExit)
+    {
+        // Special exit case that doesn't have to update pcpos
+        if (vmExitOp(op) == kVmExitEntryGuardPc)
+            return helpers.exitContinueVmClearNativeFlag;
+
+        if (uint32_t* index = exitHandlerMap.find(vmExitOp(op)))
+            return exitHandlers[*index].self;
+
+        return fresh;
+    }
+
+    return labelOp(op);
+}
+
+void IrLoweringX64::finalizeTargetLabel(IrOp op, Label& fresh)
+{
+    if (op.kind == IrOpKind::VmExit && fresh.id != 0 && fresh.id != helpers.exitContinueVmClearNativeFlag.id)
+    {
+        exitHandlerMap[vmExitOp(op)] = uint32_t(exitHandlers.size());
+        exitHandlers.push_back({fresh, vmExitOp(op)});
+    }
+}
+
+void IrLoweringX64::jumpOrFallthrough(IrBlock& target, const IrBlock& next)
 {
     if (!isFallthroughBlock(target, next))
         build.jmp(target.label);
 }
 
-void IrLoweringX64::jumpOrAbortOnUndef(ConditionX64 cond, ConditionX64 condInverse, IrOp targetOrUndef)
+void IrLoweringX64::jumpOrAbortOnUndef(ConditionX64 cond, IrOp target, const IrBlock& next)
 {
-    if (targetOrUndef.kind == IrOpKind::Undef)
+    Label fresh;
+    Label& label = getTargetLabel(target, fresh);
+
+    if (target.kind == IrOpKind::Undef)
     {
-        Label skip;
-        build.jcc(condInverse, skip);
-        build.ud2();
-        build.setLabel(skip);
+        if (cond == ConditionX64::Count)
+        {
+            build.ud2(); // Unconditional jump to abort is just an abort
+        }
+        else
+        {
+            build.jcc(getReverseCondition(cond), label);
+            build.ud2();
+            build.setLabel(label);
+        }
+    }
+    else if (cond == ConditionX64::Count)
+    {
+        // Unconditional jump can be skipped if it's a fallthrough
+        if (target.kind == IrOpKind::VmExit || !isFallthroughBlock(blockOp(target), next))
+            build.jmp(label);
     }
     else
     {
-        build.jcc(cond, labelOp(targetOrUndef));
+        build.jcc(cond, label);
     }
+
+    finalizeTargetLabel(target, fresh);
+}
+
+void IrLoweringX64::jumpOrAbortOnUndef(IrOp target, const IrBlock& next)
+{
+    jumpOrAbortOnUndef(ConditionX64::Count, target, next);
 }
 
 OperandX64 IrLoweringX64::memRegDoubleOp(IrOp op)
@@ -1398,7 +2230,7 @@ OperandX64 IrLoweringX64::memRegDoubleOp(IrOp op)
     case IrOpKind::VmConst:
         return luauConstantValue(vmConstOp(op));
     default:
-        LUAU_ASSERT(!"Unsupported operand kind");
+        CODEGEN_ASSERT(!"Unsupported operand kind");
     }
 
     return noreg;
@@ -1412,8 +2244,10 @@ OperandX64 IrLoweringX64::memRegUintOp(IrOp op)
         return regOp(op);
     case IrOpKind::Constant:
         return OperandX64(unsigned(intOp(op)));
+    case IrOpKind::VmReg:
+        return luauRegValueInt(vmRegOp(op));
     default:
-        LUAU_ASSERT(!"Unsupported operand kind");
+        CODEGEN_ASSERT(!"Unsupported operand kind");
     }
 
     return noreg;
@@ -1430,7 +2264,7 @@ OperandX64 IrLoweringX64::memRegTagOp(IrOp op)
     case IrOpKind::VmConst:
         return luauConstantTag(vmConstOp(op));
     default:
-        LUAU_ASSERT(!"Unsupported operand kind");
+        CODEGEN_ASSERT(!"Unsupported operand kind");
     }
 
     return noreg;
@@ -1443,8 +2277,38 @@ RegisterX64 IrLoweringX64::regOp(IrOp op)
     if (inst.spilled || inst.needsReload)
         regs.restore(inst, false);
 
-    LUAU_ASSERT(inst.regX64 != noreg);
+    CODEGEN_ASSERT(inst.regX64 != noreg);
     return inst.regX64;
+}
+
+OperandX64 IrLoweringX64::bufferAddrOp(IrOp bufferOp, IrOp indexOp, uint8_t tag)
+{
+    CODEGEN_ASSERT(tag == LUA_TUSERDATA || tag == LUA_TBUFFER);
+    int dataOffset = tag == LUA_TBUFFER ? offsetof(Buffer, data) : offsetof(Udata, data);
+
+    if (indexOp.kind == IrOpKind::Inst)
+        return regOp(bufferOp) + qwordReg(regOp(indexOp)) + dataOffset;
+    else if (indexOp.kind == IrOpKind::Constant)
+        return regOp(bufferOp) + intOp(indexOp) + dataOffset;
+
+    CODEGEN_ASSERT(!"Unsupported instruction form");
+    return noreg;
+}
+
+RegisterX64 IrLoweringX64::vecOp(IrOp op, ScopedRegX64& tmp)
+{
+    IrInst source = function.instOp(op);
+    CODEGEN_ASSERT(source.cmd != IrCmd::SUBSTITUTE); // we don't process substitutions
+
+    // source that comes from memory or from tag instruction has .w = TVECTOR, which is denormal
+    // to avoid performance degradation on some CPUs we mask this component to produce zero
+    // otherwise we conservatively assume the vector is a result of a well formed math op so .w is a normal number or zero
+    if (source.cmd != IrCmd::LOAD_TVALUE && source.cmd != IrCmd::TAG_VECTOR)
+        return regOp(op);
+
+    tmp.alloc(SizeX64::xmmword);
+    build.vandps(tmp.reg, regOp(op), vectorAndMaskOp());
+    return tmp.reg;
 }
 
 IrConst IrLoweringX64::constOp(IrOp op) const
@@ -1480,6 +2344,14 @@ IrBlock& IrLoweringX64::blockOp(IrOp op) const
 Label& IrLoweringX64::labelOp(IrOp op) const
 {
     return blockOp(op).label;
+}
+
+OperandX64 IrLoweringX64::vectorAndMaskOp()
+{
+    if (vectorAndMask.base == noreg)
+        vectorAndMask = build.u32x4(~0u, ~0u, ~0u, 0);
+
+    return vectorAndMask;
 }
 
 } // namespace X64

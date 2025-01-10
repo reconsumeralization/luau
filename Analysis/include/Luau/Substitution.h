@@ -2,8 +2,7 @@
 #pragma once
 
 #include "Luau/TypeArena.h"
-#include "Luau/TypePack.h"
-#include "Luau/Type.h"
+#include "Luau/TypeFwd.h"
 #include "Luau/DenseHash.h"
 
 // We provide an implementation of substitution on types,
@@ -69,24 +68,34 @@ struct TarjanWorklistVertex
     int lastEdge;
 };
 
+struct TarjanNode
+{
+    TypeId ty;
+    TypePackId tp;
+
+    bool onStack;
+    bool dirty;
+
+    // Tarjan calculates the lowlink for each vertex,
+    // which is the lowest ancestor index reachable from the vertex.
+    int lowlink;
+};
+
 // Tarjan's algorithm for finding the SCCs in a cyclic structure.
 // https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm
 struct Tarjan
 {
+    Tarjan();
+
     // Vertices (types and type packs) are indexed, using pre-order traversal.
     DenseHashMap<TypeId, int> typeToIndex{nullptr};
     DenseHashMap<TypePackId, int> packToIndex{nullptr};
-    std::vector<TypeId> indexToType;
-    std::vector<TypePackId> indexToPack;
+
+    std::vector<TarjanNode> nodes;
 
     // Tarjan keeps a stack of vertices where we're still in the process
     // of finding their SCC.
     std::vector<int> stack;
-    std::vector<bool> onStack;
-
-    // Tarjan calculates the lowlink for each vertex,
-    // which is the lowest ancestor index reachable from the vertex.
-    std::vector<int> lowlink;
 
     int childCount = 0;
     int childLimit = 0;
@@ -98,6 +107,7 @@ struct Tarjan
     std::vector<TypeId> edgesTy;
     std::vector<TypePackId> edgesTp;
     std::vector<TarjanWorklistVertex> worklist;
+
     // This is hot code, so we optimize recursion to a stack.
     TarjanResult loop();
 
@@ -124,10 +134,20 @@ struct Tarjan
     TarjanResult visitRoot(TypeId ty);
     TarjanResult visitRoot(TypePackId ty);
 
-    // Each subclass gets called back once for each edge,
-    // and once for each SCC.
-    virtual void visitEdge(int index, int parentIndex) {}
-    virtual void visitSCC(int index) {}
+    // Used to reuse the object for a new operation
+    void clearTarjan(const TxnLog* log);
+
+    // Get/set the dirty bit for an index (grows the vector if needed)
+    bool getDirty(int index);
+    void setDirty(int index, bool d);
+
+    // Find all the dirty vertices reachable from `t`.
+    TarjanResult findDirty(TypeId t);
+    TarjanResult findDirty(TypePackId t);
+
+    // We find dirty vertices using Tarjan
+    void visitEdge(int index, int parentIndex);
+    void visitSCC(int index);
 
     // Each subclass can decide to ignore some nodes.
     virtual bool ignoreChildren(TypeId ty)
@@ -150,27 +170,6 @@ struct Tarjan
     {
         return ignoreChildren(ty);
     }
-};
-
-// We use Tarjan to calculate dirty bits. We set `dirty[i]` true
-// if the vertex with index `i` can reach a dirty vertex.
-struct FindDirty : Tarjan
-{
-    std::vector<bool> dirty;
-
-    void clearTarjan();
-
-    // Get/set the dirty bit for an index (grows the vector if needed)
-    bool getDirty(int index);
-    void setDirty(int index, bool d);
-
-    // Find all the dirty vertices reachable from `t`.
-    TarjanResult findDirty(TypeId t);
-    TarjanResult findDirty(TypePackId t);
-
-    // We find dirty vertices using Tarjan
-    void visitEdge(int index, int parentIndex) override;
-    void visitSCC(int index) override;
 
     // Subclasses should say which vertices are dirty,
     // and what to do with dirty vertices.
@@ -182,16 +181,24 @@ struct FindDirty : Tarjan
 
 // And finally substitution, which finds all the reachable dirty vertices
 // and replaces them with clean ones.
-struct Substitution : FindDirty
+struct Substitution : Tarjan
 {
 protected:
-    Substitution(const TxnLog* log_, TypeArena* arena)
-        : arena(arena)
-    {
-        log = log_;
-        LUAU_ASSERT(log);
-        LUAU_ASSERT(arena);
-    }
+    Substitution(const TxnLog* log_, TypeArena* arena);
+
+    /*
+     * By default, Substitution assumes that the types produced by clean() are
+     * freshly allocated types that are safe to mutate.
+     *
+     * If your clean() implementation produces a type that is not safe to
+     * mutate, you must call dontTraverseInto on this type (or type pack) to
+     * prevent Substitution from attempting to perform substitutions within the
+     * cleaned type.
+     *
+     * See the test weird_cyclic_instantiation for an example.
+     */
+    void dontTraverseInto(TypeId ty);
+    void dontTraverseInto(TypePackId tp);
 
 public:
     TypeArena* arena;
@@ -200,8 +207,13 @@ public:
     DenseHashSet<TypeId> replacedTypes{nullptr};
     DenseHashSet<TypePackId> replacedTypePacks{nullptr};
 
+    DenseHashSet<TypeId> noTraverseTypes{nullptr};
+    DenseHashSet<TypePackId> noTraverseTypePacks{nullptr};
+
     std::optional<TypeId> substitute(TypeId ty);
     std::optional<TypePackId> substitute(TypePackId tp);
+
+    void resetState(const TxnLog* log, TypeArena* arena);
 
     TypeId replace(TypeId ty);
     TypePackId replace(TypePackId tp);

@@ -1,6 +1,7 @@
 // This file is part of the Luau programming language and is licensed under MIT License; see LICENSE.txt for details
 #include "Luau/AssemblyBuilderA64.h"
 #include "Luau/StringUtils.h"
+#include "ScopedFlags.h"
 
 #include "doctest.h"
 
@@ -8,6 +9,8 @@
 
 using namespace Luau::CodeGen;
 using namespace Luau::CodeGen::A64;
+
+LUAU_FASTFLAG(LuauVectorLibNativeDot);
 
 static std::string bytecodeAsArray(const std::vector<uint8_t>& bytecode)
 {
@@ -61,10 +64,12 @@ TEST_SUITE_BEGIN("A64Assembly");
 
 #define SINGLE_COMPARE(inst, ...) \
     CHECK(check( \
-        [](AssemblyBuilderA64& build) { \
+        [](AssemblyBuilderA64& build) \
+        { \
             build.inst; \
         }, \
-        {__VA_ARGS__}))
+        {__VA_ARGS__} \
+    ))
 
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Unary")
 {
@@ -76,6 +81,8 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Unary")
     SINGLE_COMPARE(clz(w0, w1), 0x5AC01020);
     SINGLE_COMPARE(rbit(x0, x1), 0xDAC00020);
     SINGLE_COMPARE(rbit(w0, w1), 0x5AC00020);
+    SINGLE_COMPARE(rev(w0, w1), 0x5AC00820);
+    SINGLE_COMPARE(rev(x0, x1), 0xDAC00C20);
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Binary")
@@ -105,6 +112,13 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Binary")
     SINGLE_COMPARE(add(w3, w7, 78), 0x110138E3);
     SINGLE_COMPARE(sub(w3, w7, 78), 0x510138E3);
     SINGLE_COMPARE(cmp(w0, 42), 0x7100A81F);
+}
+
+TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "BinaryExtended")
+{
+    // reg, reg
+    SINGLE_COMPARE(add(x0, x1, w2, 3), 0x8B224C20);
+    SINGLE_COMPARE(sub(x0, x1, w2, 3), 0xCB224C20);
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "BinaryImm")
@@ -209,6 +223,7 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Moves")
 {
     SINGLE_COMPARE(mov(x0, x1), 0xAA0103E0);
     SINGLE_COMPARE(mov(w0, w1), 0x2A0103E0);
+    SINGLE_COMPARE(mov(q0, q1), 0x4EA11C20);
 
     SINGLE_COMPARE(movz(x0, 42), 0xD2800540);
     SINGLE_COMPARE(movz(w0, 42), 0x52800540);
@@ -217,66 +232,83 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Moves")
     SINGLE_COMPARE(movk(x0, 42, 16), 0xF2A00540);
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.mov(x0, 42);
         },
-        {0xD2800540}));
+        {0xD2800540}
+    ));
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.mov(x0, 424242);
         },
-        {0xD28F2640, 0xF2A000C0}));
+        {0xD28F2640, 0xF2A000C0}
+    ));
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.mov(x0, -42);
         },
-        {0x92800520}));
+        {0x92800520}
+    ));
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.mov(x0, -424242);
         },
-        {0x928F2620, 0xF2BFFF20}));
+        {0x928F2620, 0xF2BFFF20}
+    ));
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.mov(x0, -65536);
         },
-        {0x929FFFE0}));
+        {0x929FFFE0}
+    ));
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.mov(x0, -65537);
         },
-        {0x92800000, 0xF2BFFFC0}));
+        {0x92800000, 0xF2BFFFC0}
+    ));
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "ControlFlow")
 {
     // Jump back
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             Label start = build.setLabel();
             build.mov(x0, x1);
             build.b(ConditionA64::Equal, start);
         },
-        {0xAA0103E0, 0x54FFFFE0}));
+        {0xAA0103E0, 0x54FFFFE0}
+    ));
 
     // Jump forward
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             Label skip;
             build.b(ConditionA64::Equal, skip);
             build.mov(x0, x1);
             build.setLabel(skip);
         },
-        {0x54000040, 0xAA0103E0}));
+        {0x54000040, 0xAA0103E0}
+    ));
 
     // Jumps
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             Label skip;
             build.b(ConditionA64::Equal, skip);
             build.cbz(x0, skip);
@@ -287,7 +319,8 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "ControlFlow")
             build.b(skip);
             build.bl(skip);
         },
-        {0x540000A0, 0xB4000080, 0xB5000060, 0x36280040, 0x37280020, 0x14000000, 0x97ffffff}));
+        {0x540000A0, 0xB4000080, 0xB5000060, 0x36280040, 0x37280020, 0x14000000, 0x97ffffff}
+    ));
 
     // Basic control flow
     SINGLE_COMPARE(br(x0), 0xD61F0000);
@@ -356,13 +389,23 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPBasic")
 
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPMath")
 {
+    ScopedFastFlag sff{FFlag::LuauVectorLibNativeDot, true};
+
     SINGLE_COMPARE(fabs(d1, d2), 0x1E60C041);
     SINGLE_COMPARE(fadd(d1, d2, d3), 0x1E632841);
+    SINGLE_COMPARE(fadd(s29, s29, s28), 0x1E3C2BBD);
     SINGLE_COMPARE(fdiv(d1, d2, d3), 0x1E631841);
+    SINGLE_COMPARE(fdiv(s29, s29, s28), 0x1E3C1BBD);
     SINGLE_COMPARE(fmul(d1, d2, d3), 0x1E630841);
+    SINGLE_COMPARE(fmul(s29, s29, s28), 0x1E3C0BBD);
     SINGLE_COMPARE(fneg(d1, d2), 0x1E614041);
+    SINGLE_COMPARE(fneg(s30, s30), 0x1E2143DE);
     SINGLE_COMPARE(fsqrt(d1, d2), 0x1E61C041);
     SINGLE_COMPARE(fsub(d1, d2, d3), 0x1E633841);
+    SINGLE_COMPARE(fsub(s29, s29, s28), 0x1E3C3BBD);
+
+    SINGLE_COMPARE(faddp(s29, s28), 0x7E30DB9D);
+    SINGLE_COMPARE(faddp(d29, d28), 0x7E70DB9D);
 
     SINGLE_COMPARE(frinta(d1, d2), 0x1E664041);
     SINGLE_COMPARE(frintm(d1, d2), 0x1E654041);
@@ -382,10 +425,14 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPMath")
     SINGLE_COMPARE(ucvtf(d1, x2), 0x9E630041);
 
     CHECK(check(
-        [](AssemblyBuilderA64& build) {
+        [](AssemblyBuilderA64& build)
+        {
             build.fjcvtzs(w1, d2);
         },
-        {0x1E7E0041}, {}, A64::Feature_JSCVT));
+        {0x1E7E0041},
+        {},
+        A64::Feature_JSCVT
+    ));
 }
 
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPLoadStore")
@@ -417,6 +464,14 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPLoadStore")
     SINGLE_COMPARE(str(s0, mem(x1, 16)), 0xBD001020);
 }
 
+TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPInsertExtract")
+{
+    SINGLE_COMPARE(ins_4s(q29, w17, 3), 0x4E1C1E3D);
+    SINGLE_COMPARE(ins_4s(q31, 0, q29, 0), 0x6E0407BF);
+    SINGLE_COMPARE(dup_4s(s29, q31, 2), 0x5E1407FD);
+    SINGLE_COMPARE(dup_4s(q29, q30, 0), 0x4E0407DD);
+}
+
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPCompare")
 {
     SINGLE_COMPARE(fcmp(d0, d1), 0x1E612000);
@@ -428,6 +483,12 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "FPImm")
     SINGLE_COMPARE(fmov(d0, 0), 0x2F00E400);
     SINGLE_COMPARE(fmov(d0, 0.125), 0x1E681000);
     SINGLE_COMPARE(fmov(d0, -0.125), 0x1E781000);
+    SINGLE_COMPARE(fmov(d0, 1.9375), 0x1E6FF000);
+
+    SINGLE_COMPARE(fmov(q0, 0), 0x4F000400);
+    SINGLE_COMPARE(fmov(q0, 0.125), 0x4F02F400);
+    SINGLE_COMPARE(fmov(q0, -0.125), 0x4F06F400);
+    SINGLE_COMPARE(fmov(q0, 1.9375), 0x4F03F7E0);
 
     CHECK(!AssemblyBuilderA64::isFmovSupported(-0.0));
     CHECK(!AssemblyBuilderA64::isFmovSupported(0.12389));
@@ -458,6 +519,34 @@ TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Conditionals")
 TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "Undefined")
 {
     SINGLE_COMPARE(udf(), 0x00000000);
+}
+
+TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "PrePostIndexing")
+{
+    SINGLE_COMPARE(ldr(x0, mem(x1, 1)), 0xF8401020);
+    SINGLE_COMPARE(ldr(x0, mem(x1, 1, AddressKindA64::pre)), 0xF8401C20);
+    SINGLE_COMPARE(ldr(x0, mem(x1, 1, AddressKindA64::post)), 0xF8401420);
+
+    SINGLE_COMPARE(ldr(q0, mem(x1, 1)), 0x3CC01020);
+    SINGLE_COMPARE(ldr(q0, mem(x1, 1, AddressKindA64::pre)), 0x3CC01C20);
+    SINGLE_COMPARE(ldr(q0, mem(x1, 1, AddressKindA64::post)), 0x3CC01420);
+
+    SINGLE_COMPARE(str(x0, mem(x1, 1)), 0xF8001020);
+    SINGLE_COMPARE(str(x0, mem(x1, 1, AddressKindA64::pre)), 0xF8001C20);
+    SINGLE_COMPARE(str(x0, mem(x1, 1, AddressKindA64::post)), 0xF8001420);
+
+    SINGLE_COMPARE(str(q0, mem(x1, 1)), 0x3C801020);
+    SINGLE_COMPARE(str(q0, mem(x1, 1, AddressKindA64::pre)), 0x3C801C20);
+    SINGLE_COMPARE(str(q0, mem(x1, 1, AddressKindA64::post)), 0x3C801420);
+}
+
+TEST_CASE_FIXTURE(AssemblyBuilderA64Fixture, "SIMDMath")
+{
+    SINGLE_COMPARE(fadd(q0, q1, q2), 0x4E22D420);
+    SINGLE_COMPARE(fsub(q0, q1, q2), 0x4EA2D420);
+    SINGLE_COMPARE(fmul(q0, q1, q2), 0x6E22DC20);
+    SINGLE_COMPARE(fdiv(q0, q1, q2), 0x6E22FC20);
+    SINGLE_COMPARE(fneg(q0, q1), 0x6EA0F820);
 }
 
 TEST_CASE("LogTest")
@@ -501,6 +590,18 @@ TEST_CASE("LogTest")
 
     build.ubfx(x1, x2, 37, 5);
 
+    build.ldr(x0, mem(x1, 1));
+    build.ldr(x0, mem(x1, 1, AddressKindA64::pre));
+    build.ldr(x0, mem(x1, 1, AddressKindA64::post));
+
+    build.add(x1, x2, w3, 3);
+
+    build.ins_4s(q29, w17, 3);
+    build.ins_4s(q31, 1, q29, 2);
+    build.dup_4s(s29, q31, 2);
+    build.dup_4s(q29, q30, 0);
+    build.fmul(q0, q1, q2);
+
     build.setLabel(l);
     build.ret();
 
@@ -534,6 +635,15 @@ TEST_CASE("LogTest")
  tbz         x0,#5,.L1
  fcvt        s1,d2
  ubfx        x1,x2,#3705
+ ldr         x0,[x1,#1]
+ ldr         x0,[x1,#1]!
+ ldr         x0,[x1]!,#1
+ add         x1,x2,w3 UXTW #3
+ ins         v29.s[3],w17
+ ins         v31.s[1],v29.s[2]
+ dup         s29,v31.s[2]
+ dup         v29.4s,v30.s[0]
+ fmul        v0.4s,v1.4s,v2.4s
 .L1:
  ret
 )";

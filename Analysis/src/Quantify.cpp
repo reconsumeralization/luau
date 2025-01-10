@@ -8,10 +8,6 @@
 #include "Luau/Type.h"
 #include "Luau/VisitType.h"
 
-LUAU_FASTFLAG(DebugLuauSharedSelf)
-LUAU_FASTFLAG(DebugLuauDeferredConstraintResolution);
-LUAU_FASTFLAG(LuauClassTypeVarsInSubstitution)
-
 namespace Luau
 {
 
@@ -102,53 +98,13 @@ struct Quantifier final : TypeOnceVisitor
 
 void quantify(TypeId ty, TypeLevel level)
 {
-    if (FFlag::DebugLuauSharedSelf)
-    {
-        ty = follow(ty);
+    Quantifier q{level};
+    q.traverse(ty);
 
-        if (auto ttv = getTableType(ty); ttv && ttv->selfTy)
-        {
-            Quantifier selfQ{level};
-            selfQ.traverse(*ttv->selfTy);
-
-            Quantifier q{level};
-            q.traverse(ty);
-
-            for (const auto& [_, prop] : ttv->props)
-            {
-                auto ftv = getMutable<FunctionType>(follow(prop.type()));
-                if (!ftv || !ftv->hasSelf)
-                    continue;
-
-                if (Luau::first(ftv->argTypes) == ttv->selfTy)
-                {
-                    ftv->generics.insert(ftv->generics.end(), selfQ.generics.begin(), selfQ.generics.end());
-                    ftv->genericPacks.insert(ftv->genericPacks.end(), selfQ.genericPacks.begin(), selfQ.genericPacks.end());
-                }
-            }
-        }
-        else if (auto ftv = getMutable<FunctionType>(ty))
-        {
-            Quantifier q{level};
-            q.traverse(ty);
-
-            ftv->generics.insert(ftv->generics.end(), q.generics.begin(), q.generics.end());
-            ftv->genericPacks.insert(ftv->genericPacks.end(), q.genericPacks.begin(), q.genericPacks.end());
-
-            if (ftv->generics.empty() && ftv->genericPacks.empty() && !q.seenMutableType && !q.seenGenericType)
-                ftv->hasNoFreeOrGenericTypes = true;
-        }
-    }
-    else
-    {
-        Quantifier q{level};
-        q.traverse(ty);
-
-        FunctionType* ftv = getMutable<FunctionType>(ty);
-        LUAU_ASSERT(ftv);
-        ftv->generics.insert(ftv->generics.end(), q.generics.begin(), q.generics.end());
-        ftv->genericPacks.insert(ftv->genericPacks.end(), q.genericPacks.begin(), q.genericPacks.end());
-    }
+    FunctionType* ftv = getMutable<FunctionType>(ty);
+    LUAU_ASSERT(ftv);
+    ftv->generics.insert(ftv->generics.end(), q.generics.begin(), q.generics.end());
+    ftv->genericPacks.insert(ftv->genericPacks.end(), q.genericPacks.begin(), q.genericPacks.end());
 }
 
 struct PureQuantifier : Substitution
@@ -244,7 +200,7 @@ struct PureQuantifier : Substitution
 
     bool ignoreChildren(TypeId ty) override
     {
-        if (FFlag::LuauClassTypeVarsInSubstitution && get<ClassType>(ty))
+        if (get<ClassType>(ty))
             return true;
 
         return ty->persistent;

@@ -2,17 +2,28 @@
 #include "Luau/OptimizeConstProp.h"
 
 #include "Luau/DenseHash.h"
-#include "Luau/IrAnalysis.h"
+#include "Luau/IrData.h"
 #include "Luau/IrBuilder.h"
 #include "Luau/IrUtils.h"
 
 #include "lua.h"
 
+#include <limits.h>
+#include <math.h>
+
+#include <algorithm>
 #include <array>
+#include <utility>
 #include <vector>
 
 LUAU_FASTINTVARIABLE(LuauCodeGenMinLinearBlockPath, 3)
-LUAU_FASTFLAGVARIABLE(DebugLuauAbortingChecks, false)
+LUAU_FASTINTVARIABLE(LuauCodeGenReuseSlotLimit, 64)
+LUAU_FASTINTVARIABLE(LuauCodeGenReuseUdataTagLimit, 64)
+LUAU_FASTINTVARIABLE(LuauCodeGenLiveSlotReuseLimit, 8)
+LUAU_FASTFLAGVARIABLE(DebugLuauAbortingChecks)
+LUAU_FASTFLAG(LuauVectorLibNativeDot)
+LUAU_FASTFLAGVARIABLE(LuauCodeGenArithOpt)
+LUAU_FASTFLAGVARIABLE(LuauCodeGenLimitLiveSlotReuse)
 
 namespace Luau
 {
@@ -31,6 +42,7 @@ struct RegisterInfo
 
     bool knownNotReadonly = false;
     bool knownNoMetatable = false;
+    int knownTableArraySize = -1;
 };
 
 // Load instructions are linked to target register to carry knowledge about the target
@@ -39,6 +51,14 @@ struct RegisterLink
 {
     uint8_t reg = 0;
     uint32_t version = 0;
+};
+
+// Reference to an instruction together with the position of that instruction in the current block chain and the last position of reuse
+struct NumberedInstruction
+{
+    uint32_t instIdx = 0;
+    uint32_t startPos = 0;
+    uint32_t finishPos = 0;
 };
 
 // Data we know about the current VM state
@@ -86,7 +106,7 @@ struct ConstPropState
 
     void saveValue(IrOp op, IrOp value)
     {
-        LUAU_ASSERT(value.kind == IrOpKind::Constant);
+        CODEGEN_ASSERT(value.kind == IrOpKind::Constant);
 
         if (RegisterInfo* info = tryGetRegisterInfo(op))
         {
@@ -95,6 +115,7 @@ struct ConstPropState
                 info->value = value;
                 info->knownNotReadonly = false;
                 info->knownNoMetatable = false;
+                info->knownTableArraySize = -1;
                 info->version++;
             }
         }
@@ -112,6 +133,7 @@ struct ConstPropState
             reg.value = {};
             reg.knownNotReadonly = false;
             reg.knownNoMetatable = false;
+            reg.knownTableArraySize = -1;
         }
 
         reg.version++;
@@ -166,16 +188,55 @@ struct ConstPropState
         }
     }
 
+    // Value propagation extends the live range of an SSA register
+    // In some cases we can't propagate earlier values because we can't guarantee that we will be able to find a storage/restore location
+    // As an example, when Luau call is performed, both volatile registers and stack slots might be overwritten
+    void invalidateValuePropagation()
+    {
+        valueMap.clear();
+        tryNumToIndexCache.clear();
+    }
+
+    // If table memory has changed, we can't reuse previously computed and validated table slot lookups
+    // Same goes for table array elements as well
+    void invalidateHeapTableData()
+    {
+        if (FFlag::LuauCodeGenLimitLiveSlotReuse)
+            getSlotNodeCache.clear();
+        else
+            getSlotNodeCache_DEPRECATED.clear();
+
+        checkSlotMatchCache.clear();
+
+        getArrAddrCache.clear();
+        checkArraySizeCache.clear();
+    }
+
+    void invalidateHeapBufferData()
+    {
+        checkBufferLenCache.clear();
+    }
+
+    void invalidateUserdataData()
+    {
+        useradataTagCache.clear();
+    }
+
     void invalidateHeap()
     {
         for (int i = 0; i <= maxReg; ++i)
             invalidateHeap(regs[i]);
+
+        invalidateHeapTableData();
+
+        // Buffer length checks are not invalidated since buffer size is immutable
     }
 
     void invalidateHeap(RegisterInfo& reg)
     {
         reg.knownNotReadonly = false;
         reg.knownNoMetatable = false;
+        reg.knownTableArraySize = -1;
     }
 
     void invalidateUserCall()
@@ -185,9 +246,22 @@ struct ConstPropState
         inSafeEnv = false;
     }
 
+    void invalidateTableArraySize()
+    {
+        for (int i = 0; i <= maxReg; ++i)
+            invalidateTableArraySize(regs[i]);
+
+        invalidateHeapTableData();
+    }
+
+    void invalidateTableArraySize(RegisterInfo& reg)
+    {
+        reg.knownTableArraySize = -1;
+    }
+
     void createRegLink(uint32_t instIdx, IrOp regOp)
     {
-        LUAU_ASSERT(!instLink.contains(instIdx));
+        CODEGEN_ASSERT(!instLink.contains(instIdx));
         instLink[instIdx] = RegisterLink{uint8_t(vmRegOp(regOp)), regs[vmRegOp(regOp)].version};
     }
 
@@ -229,11 +303,55 @@ struct ConstPropState
     // This is used to allow instructions with register references to be compared for equality
     IrInst versionedVmRegLoad(IrCmd loadCmd, IrOp op)
     {
-        LUAU_ASSERT(op.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(op.kind == IrOpKind::VmReg);
         uint32_t version = regs[vmRegOp(op)].version;
-        LUAU_ASSERT(version <= 0xffffff);
+        CODEGEN_ASSERT(version <= 0xffffff);
         op.index = vmRegOp(op) | (version << 8);
         return IrInst{loadCmd, op};
+    }
+
+    uint32_t* getPreviousInstIndex(const IrInst& inst)
+    {
+        CODEGEN_ASSERT(useValueNumbering);
+
+        if (uint32_t* prevIdx = valueMap.find(inst))
+        {
+            // Previous load might have been removed as unused
+            if (function.instructions[*prevIdx].useCount != 0)
+                return prevIdx;
+        }
+
+        return nullptr;
+    }
+
+    uint32_t* getPreviousVersionedLoadIndex(IrCmd cmd, IrOp vmReg)
+    {
+        CODEGEN_ASSERT(vmReg.kind == IrOpKind::VmReg);
+        return getPreviousInstIndex(versionedVmRegLoad(cmd, vmReg));
+    }
+
+    std::pair<IrCmd, uint32_t> getPreviousVersionedLoadForTag(uint8_t tag, IrOp vmReg)
+    {
+        if (useValueNumbering && !function.cfg.captured.regs.test(vmRegOp(vmReg)))
+        {
+            if (tag == LUA_TBOOLEAN)
+            {
+                if (uint32_t* prevIdx = getPreviousVersionedLoadIndex(IrCmd::LOAD_INT, vmReg))
+                    return std::make_pair(IrCmd::LOAD_INT, *prevIdx);
+            }
+            else if (tag == LUA_TNUMBER)
+            {
+                if (uint32_t* prevIdx = getPreviousVersionedLoadIndex(IrCmd::LOAD_DOUBLE, vmReg))
+                    return std::make_pair(IrCmd::LOAD_DOUBLE, *prevIdx);
+            }
+            else if (isGCO(tag))
+            {
+                if (uint32_t* prevIdx = getPreviousVersionedLoadIndex(IrCmd::LOAD_POINTER, vmReg))
+                    return std::make_pair(IrCmd::LOAD_POINTER, *prevIdx);
+            }
+        }
+
+        return std::make_pair(IrCmd::NOP, kInvalidInstIdx);
     }
 
     // Find existing value of the instruction that is exactly the same, or record current on for future lookups
@@ -242,54 +360,42 @@ struct ConstPropState
         if (!useValueNumbering)
             return;
 
-        if (uint32_t* prevIdx = valueMap.find(inst))
+        if (uint32_t* prevIdx = getPreviousInstIndex(inst))
         {
-            const IrInst& prev = function.instructions[*prevIdx];
-
-            // Previous load might have been removed as unused
-            if (prev.useCount != 0)
-            {
-                substitute(function, inst, IrOp{IrOpKind::Inst, *prevIdx});
-                return;
-            }
+            substitute(function, inst, IrOp{IrOpKind::Inst, *prevIdx});
+            return;
         }
 
         valueMap[inst] = instIdx;
     }
 
-    // Vm register load can be replaced by a previous load of the same version of the register
+    // VM register load can be replaced by a previous load of the same version of the register
     // If there is no previous load, we record the current one for future lookups
     void substituteOrRecordVmRegLoad(IrInst& loadInst)
     {
-        LUAU_ASSERT(loadInst.a.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(loadInst.a.kind == IrOpKind::VmReg);
 
         if (!useValueNumbering)
             return;
 
         // To avoid captured register invalidation tracking in lowering later, values from loads from captured registers are not propagated
-        // This prevents the case where load value location is linked to memory in case of a spill and is then cloberred in a user call
+        // This prevents the case where load value location is linked to memory in case of a spill and is then clobbered in a user call
         if (function.cfg.captured.regs.test(vmRegOp(loadInst.a)))
             return;
 
         IrInst versionedLoad = versionedVmRegLoad(loadInst.cmd, loadInst.a);
 
         // Check if there is a value that already has this version of the register
-        if (uint32_t* prevIdx = valueMap.find(versionedLoad))
+        if (uint32_t* prevIdx = getPreviousInstIndex(versionedLoad))
         {
-            const IrInst& prev = function.instructions[*prevIdx];
+            // Previous value might not be linked to a register yet
+            // For example, it could be a NEW_TABLE stored into a register and we might need to track guards made with this value
+            if (!instLink.contains(*prevIdx))
+                createRegLink(*prevIdx, loadInst.a);
 
-            // Previous load might have been removed as unused
-            if (prev.useCount != 0)
-            {
-                // Previous value might not be linked to a register yet
-                // For example, it could be a NEW_TABLE stored into a register and we might need to track guards made with this value
-                if (!instLink.contains(*prevIdx))
-                    createRegLink(*prevIdx, loadInst.a);
-
-                // Substitute load instructon with the previous value
-                substitute(function, loadInst, IrOp{IrOpKind::Inst, *prevIdx});
-                return;
-            }
+            // Substitute load instruction with the previous value
+            substitute(function, loadInst, IrOp{IrOpKind::Inst, *prevIdx});
+            return;
         }
 
         uint32_t instIdx = function.getInstIndex(loadInst);
@@ -303,19 +409,77 @@ struct ConstPropState
     // VM register loads can use the value that was stored in the same Vm register earlier
     void forwardVmRegStoreToLoad(const IrInst& storeInst, IrCmd loadCmd)
     {
-        LUAU_ASSERT(storeInst.a.kind == IrOpKind::VmReg);
-        LUAU_ASSERT(storeInst.b.kind == IrOpKind::Inst);
+        CODEGEN_ASSERT(storeInst.a.kind == IrOpKind::VmReg);
+        CODEGEN_ASSERT(storeInst.b.kind == IrOpKind::Inst);
 
         if (!useValueNumbering)
             return;
 
         // To avoid captured register invalidation tracking in lowering later, values from stores into captured registers are not propagated
-        // This prevents the case where store creates an alternative value location in case of a spill and is then cloberred in a user call
+        // This prevents the case where store creates an alternative value location in case of a spill and is then clobbered in a user call
         if (function.cfg.captured.regs.test(vmRegOp(storeInst.a)))
             return;
 
         // Future loads of this register version can use the value we stored
         valueMap[versionedVmRegLoad(loadCmd, storeInst.a)] = storeInst.b.index;
+    }
+
+    // Used to compute the pressure of the cached value 'set' on the spill registers
+    // We want to find out the maximum live range intersection count between the cached value at 'slot' and current instruction
+    // Note that this pressure is approximate, as some values that might have been live at one point could have been marked dead later
+    int getMaxInternalOverlap(std::vector<NumberedInstruction>& set, size_t slot)
+    {
+        CODEGEN_ASSERT(FFlag::LuauCodeGenLimitLiveSlotReuse);
+
+        // Start with one live range for the slot we want to reuse
+        int curr = 1;
+
+        // For any slots where lifetime began before the slot of interest, mark as live if lifetime end is still active
+        // This saves us from processing slots [0; slot] in the range sweep later, which requires sorting the lifetime end points
+        for (size_t i = 0; i < slot; i++)
+        {
+            if (set[i].finishPos >= set[slot].startPos)
+                curr++;
+        }
+
+        int max = curr;
+
+        // Collect lifetime end points and sort them
+        rangeEndTemp.clear();
+
+        for (size_t i = slot + 1; i < set.size(); i++)
+            rangeEndTemp.push_back(set[i].finishPos);
+
+        std::sort(rangeEndTemp.begin(), rangeEndTemp.end());
+
+        // Go over the lifetime begin/end ranges that we store as separate array and walk based on the smallest of values
+        for (size_t i1 = slot + 1, i2 = 0; i1 < set.size() && i2 < rangeEndTemp.size();)
+        {
+            if (rangeEndTemp[i2] == set[i1].startPos)
+            {
+                i1++;
+                i2++;
+            }
+            else if (rangeEndTemp[i2] < set[i1].startPos)
+            {
+                CODEGEN_ASSERT(curr > 0);
+
+                curr--;
+                i2++;
+            }
+            else
+            {
+                curr++;
+                i1++;
+
+                if (curr > max)
+                    max = curr;
+            }
+        }
+
+        // We might have unprocessed lifetime end entries, but we will never have unprocessed lifetime start entries
+        // Not that lifetime end entries can only decrease the current value and do not affect the end result (maximum)
+        return max;
     }
 
     void clear()
@@ -325,11 +489,18 @@ struct ConstPropState
 
         maxReg = 0;
 
+        if (FFlag::LuauCodeGenLimitLiveSlotReuse)
+            instPos = 0u;
+
         inSafeEnv = false;
         checkedGc = false;
 
         instLink.clear();
-        valueMap.clear();
+
+        invalidateValuePropagation();
+        invalidateHeapTableData();
+        invalidateHeapBufferData();
+        invalidateUserdataData();
     }
 
     IrFunction& function;
@@ -341,12 +512,33 @@ struct ConstPropState
     // For range/full invalidations, we only want to visit a limited number of data that we have recorded
     int maxReg = 0;
 
+    // Number of the instruction being processed
+    uint32_t instPos = 0;
+
     bool inSafeEnv = false;
     bool checkedGc = false;
 
     DenseHashMap<uint32_t, RegisterLink> instLink{~0u};
 
     DenseHashMap<IrInst, uint32_t, IrInstHash, IrInstEq> valueMap;
+
+    // Some instruction re-uses can't be stored in valueMap because of extra requirements
+    std::vector<uint32_t> tryNumToIndexCache; // Fallback block argument might be different
+
+    // Heap changes might affect table state
+    std::vector<NumberedInstruction> getSlotNodeCache; // Additionally, pcpos argument might be different
+    std::vector<uint32_t> getSlotNodeCache_DEPRECATED; // Additionally, pcpos argument might be different
+    std::vector<uint32_t> checkSlotMatchCache; // Additionally, fallback block argument might be different
+
+    std::vector<uint32_t> getArrAddrCache;
+    std::vector<uint32_t> checkArraySizeCache; // Additionally, fallback block argument might be different
+
+    std::vector<uint32_t> checkBufferLenCache; // Additionally, fallback block argument might be different
+
+    // Userdata tag cache can point to both NEW_USERDATA and CHECK_USERDATA_TAG instructions
+    std::vector<uint32_t> useradataTagCache; // Additionally, fallback block argument might be different
+
+    std::vector<uint32_t> rangeEndTemp;
 };
 
 static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid, uint32_t firstReturnReg, int nresults)
@@ -403,10 +595,8 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
     case LBF_MATH_CLAMP:
     case LBF_MATH_SIGN:
     case LBF_MATH_ROUND:
-    case LBF_RAWSET:
     case LBF_RAWGET:
     case LBF_RAWEQUAL:
-    case LBF_TABLE_INSERT:
     case LBF_TABLE_UNPACK:
     case LBF_VECTOR:
     case LBF_BIT32_COUNTLZ:
@@ -415,6 +605,40 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
     case LBF_RAWLEN:
     case LBF_BIT32_EXTRACTK:
     case LBF_GETMETATABLE:
+    case LBF_TONUMBER:
+    case LBF_TOSTRING:
+    case LBF_BIT32_BYTESWAP:
+    case LBF_BUFFER_READI8:
+    case LBF_BUFFER_READU8:
+    case LBF_BUFFER_WRITEU8:
+    case LBF_BUFFER_READI16:
+    case LBF_BUFFER_READU16:
+    case LBF_BUFFER_WRITEU16:
+    case LBF_BUFFER_READI32:
+    case LBF_BUFFER_READU32:
+    case LBF_BUFFER_WRITEU32:
+    case LBF_BUFFER_READF32:
+    case LBF_BUFFER_WRITEF32:
+    case LBF_BUFFER_READF64:
+    case LBF_BUFFER_WRITEF64:
+    case LBF_VECTOR_MAGNITUDE:
+    case LBF_VECTOR_NORMALIZE:
+    case LBF_VECTOR_CROSS:
+    case LBF_VECTOR_DOT:
+    case LBF_VECTOR_FLOOR:
+    case LBF_VECTOR_CEIL:
+    case LBF_VECTOR_ABS:
+    case LBF_VECTOR_SIGN:
+    case LBF_VECTOR_CLAMP:
+    case LBF_VECTOR_MIN:
+    case LBF_VECTOR_MAX:
+    case LBF_MATH_LERP:
+        break;
+    case LBF_TABLE_INSERT:
+        state.invalidateHeap();
+        return; // table.insert does not modify result registers.
+    case LBF_RAWSET:
+        state.invalidateHeap();
         break;
     case LBF_SETMETATABLE:
         state.invalidateHeap(); // TODO: only knownNoMetatable is affected and we might know which one
@@ -428,29 +652,46 @@ static void handleBuiltinEffects(ConstPropState& state, LuauBuiltinFunction bfid
 
 static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction& function, IrBlock& block, IrInst& inst, uint32_t index)
 {
+    if (FFlag::LuauCodeGenLimitLiveSlotReuse)
+        state.instPos++;
+
     switch (inst.cmd)
     {
     case IrCmd::LOAD_TAG:
         if (uint8_t tag = state.tryGetTag(inst.a); tag != 0xff)
+        {
             substitute(function, inst, build.constTag(tag));
+        }
         else if (inst.a.kind == IrOpKind::VmReg)
-            state.createRegLink(index, inst.a);
+        {
+            state.substituteOrRecordVmRegLoad(inst);
+        }
         break;
     case IrCmd::LOAD_POINTER:
         if (inst.a.kind == IrOpKind::VmReg)
             state.substituteOrRecordVmRegLoad(inst);
         break;
     case IrCmd::LOAD_DOUBLE:
-        if (IrOp value = state.tryGetValue(inst.a); value.kind == IrOpKind::Constant)
+    {
+        IrOp value = state.tryGetValue(inst.a);
+
+        if (function.asDoubleOp(value))
             substitute(function, inst, value);
         else if (inst.a.kind == IrOpKind::VmReg)
             state.substituteOrRecordVmRegLoad(inst);
         break;
+    }
     case IrCmd::LOAD_INT:
-        if (IrOp value = state.tryGetValue(inst.a); value.kind == IrOpKind::Constant)
+    {
+        IrOp value = state.tryGetValue(inst.a);
+
+        if (function.asIntOp(value))
             substitute(function, inst, value);
         else if (inst.a.kind == IrOpKind::VmReg)
             state.substituteOrRecordVmRegLoad(inst);
+        break;
+    }
+    case IrCmd::LOAD_FLOAT:
         break;
     case IrCmd::LOAD_TVALUE:
         if (inst.a.kind == IrOpKind::VmReg)
@@ -460,49 +701,55 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         if (inst.a.kind == IrOpKind::VmReg)
         {
             const IrOp source = inst.a;
-            uint32_t activeLoadDoubleValue = kInvalidInstIdx;
+
+            IrCmd activeLoadCmd = IrCmd::NOP;
+            uint32_t activeLoadValue = kInvalidInstIdx;
 
             if (inst.b.kind == IrOpKind::Constant)
             {
                 uint8_t value = function.tagOp(inst.b);
 
                 // STORE_TAG usually follows a store of the value, but it also bumps the version of the whole register
-                // To be able to propagate STORE_DOUBLE into LOAD_DOUBLE, we find active LOAD_DOUBLE value and recreate it with updated version
+                // To be able to propagate STORE_*** into LOAD_***, we find active LOAD_*** value and recreate it with updated version
                 // Register in this optimization cannot be captured to avoid complications in lowering (IrValueLocationTracking doesn't model it)
-                // If stored tag is not a number, we can skip the lookup as there won't be future loads of this register as a number
-                if (value == LUA_TNUMBER && !function.cfg.captured.regs.test(vmRegOp(source)))
-                {
-                    if (uint32_t* prevIdx = state.valueMap.find(state.versionedVmRegLoad(IrCmd::LOAD_DOUBLE, source)))
-                        activeLoadDoubleValue = *prevIdx;
-                }
+                std::tie(activeLoadCmd, activeLoadValue) = state.getPreviousVersionedLoadForTag(value, source);
 
                 if (state.tryGetTag(source) == value)
-                {
-                    if (FFlag::DebugLuauAbortingChecks)
-                        replace(function, block, index, {IrCmd::CHECK_TAG, inst.a, inst.b, build.undef()});
-                    else
-                        kill(function, inst);
-                }
+                    kill(function, inst);
                 else
-                {
                     state.saveTag(source, value);
-                }
             }
             else
             {
                 state.invalidateTag(source);
             }
 
-            // Future LOAD_DOUBLE instructions can re-use previous register version load
-            if (activeLoadDoubleValue != kInvalidInstIdx)
-                state.valueMap[state.versionedVmRegLoad(IrCmd::LOAD_DOUBLE, source)] = activeLoadDoubleValue;
+            // Future LOAD_*** instructions can re-use previous register version load
+            if (activeLoadValue != kInvalidInstIdx)
+                state.valueMap[state.versionedVmRegLoad(activeLoadCmd, source)] = activeLoadValue;
         }
+        break;
+    case IrCmd::STORE_EXTRA:
         break;
     case IrCmd::STORE_POINTER:
         if (inst.a.kind == IrOpKind::VmReg)
         {
             state.invalidateValue(inst.a);
-            state.forwardVmRegStoreToLoad(inst, IrCmd::LOAD_POINTER);
+
+            if (inst.b.kind == IrOpKind::Inst)
+            {
+                state.forwardVmRegStoreToLoad(inst, IrCmd::LOAD_POINTER);
+
+                if (IrInst* instOp = function.asInstOp(inst.b); instOp && instOp->cmd == IrCmd::NEW_TABLE)
+                {
+                    if (RegisterInfo* info = state.tryGetRegisterInfo(inst.a))
+                    {
+                        info->knownNotReadonly = true;
+                        info->knownNoMetatable = true;
+                        info->knownTableArraySize = function.uintOp(instOp->a);
+                    }
+                }
+            }
         }
         break;
     case IrCmd::STORE_DOUBLE:
@@ -543,17 +790,102 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         state.invalidateValue(inst.a);
         break;
     case IrCmd::STORE_TVALUE:
+        if (inst.a.kind == IrOpKind::VmReg || inst.a.kind == IrOpKind::Inst)
+        {
+            if (inst.a.kind == IrOpKind::VmReg)
+            {
+                if (inst.b.kind == IrOpKind::Inst)
+                {
+                    if (uint32_t* prevIdx = state.getPreviousVersionedLoadIndex(IrCmd::LOAD_TVALUE, inst.a))
+                    {
+                        if (*prevIdx == inst.b.index)
+                        {
+                            kill(function, inst);
+                            break;
+                        }
+                    }
+                }
+
+                state.invalidate(inst.a);
+            }
+
+            uint8_t tag = state.tryGetTag(inst.b);
+
+            // We know the tag of some instructions that result in TValue
+            if (tag == 0xff)
+            {
+                if (IrInst* arg = function.asInstOp(inst.b))
+                {
+                    if (arg->cmd == IrCmd::TAG_VECTOR)
+                        tag = LUA_TVECTOR;
+
+                    if (arg->cmd == IrCmd::LOAD_TVALUE && arg->c.kind != IrOpKind::None)
+                        tag = function.tagOp(arg->c);
+                }
+            }
+
+            IrOp value = state.tryGetValue(inst.b);
+
+            if (inst.a.kind == IrOpKind::VmReg)
+            {
+                if (tag != 0xff)
+                    state.saveTag(inst.a, tag);
+
+                if (value.kind != IrOpKind::None)
+                    state.saveValue(inst.a, value);
+            }
+
+            IrCmd activeLoadCmd = IrCmd::NOP;
+            uint32_t activeLoadValue = kInvalidInstIdx;
+
+            // If we know the tag, we can try extracting the value from a register used by LOAD_TVALUE
+            // To do that, we have to ensure that the register link of the source value is still valid
+            if (tag != 0xff && state.tryGetRegLink(inst.b) != nullptr)
+            {
+                if (IrInst* arg = function.asInstOp(inst.b); arg && arg->cmd == IrCmd::LOAD_TVALUE && arg->a.kind == IrOpKind::VmReg)
+                {
+                    std::tie(activeLoadCmd, activeLoadValue) = state.getPreviousVersionedLoadForTag(tag, arg->a);
+
+                    if (activeLoadValue != kInvalidInstIdx)
+                        value = IrOp{IrOpKind::Inst, activeLoadValue};
+                }
+            }
+
+            // If we have constant tag and value, replace TValue store with tag/value pair store
+            bool canSplitTvalueStore = false;
+
+            if (tag == LUA_TBOOLEAN &&
+                (value.kind == IrOpKind::Inst || (value.kind == IrOpKind::Constant && function.constOp(value).kind == IrConstKind::Int)))
+                canSplitTvalueStore = true;
+            else if (tag == LUA_TNUMBER &&
+                     (value.kind == IrOpKind::Inst || (value.kind == IrOpKind::Constant && function.constOp(value).kind == IrConstKind::Double)))
+                canSplitTvalueStore = true;
+            else if (tag != 0xff && isGCO(tag) && value.kind == IrOpKind::Inst)
+                canSplitTvalueStore = true;
+
+            if (canSplitTvalueStore)
+            {
+                replace(function, block, index, {IrCmd::STORE_SPLIT_TVALUE, inst.a, build.constTag(tag), value, inst.c});
+
+                // Value can be propagated to future loads of the same register
+                if (inst.a.kind == IrOpKind::VmReg && activeLoadValue != kInvalidInstIdx)
+                    state.valueMap[state.versionedVmRegLoad(activeLoadCmd, inst.a)] = activeLoadValue;
+            }
+            else if (inst.a.kind == IrOpKind::VmReg)
+            {
+                state.forwardVmRegStoreToLoad(inst, IrCmd::LOAD_TVALUE);
+            }
+        }
+        break;
+    case IrCmd::STORE_SPLIT_TVALUE:
         if (inst.a.kind == IrOpKind::VmReg)
         {
             state.invalidate(inst.a);
 
-            if (uint8_t tag = state.tryGetTag(inst.b); tag != 0xff)
-                state.saveTag(inst.a, tag);
+            state.saveTag(inst.a, function.tagOp(inst.b));
 
-            if (IrOp value = state.tryGetValue(inst.b); value.kind != IrOpKind::None)
-                state.saveValue(inst.a, value);
-
-            state.forwardVmRegStoreToLoad(inst, IrCmd::LOAD_TVALUE);
+            if (inst.c.kind == IrOpKind::Constant)
+                state.saveValue(inst.a, inst.c);
         }
         break;
     case IrCmd::JUMP_IF_TRUTHY:
@@ -586,44 +918,20 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
             else
                 replace(function, block, index, {IrCmd::JUMP, inst.d});
         }
+        else if (inst.a == inst.b)
+        {
+            replace(function, block, index, {IrCmd::JUMP, inst.c});
+        }
         break;
     }
-    case IrCmd::JUMP_EQ_INT:
+    case IrCmd::JUMP_CMP_INT:
     {
         std::optional<int> valueA = function.asIntOp(inst.a.kind == IrOpKind::Constant ? inst.a : state.tryGetValue(inst.a));
         std::optional<int> valueB = function.asIntOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b));
 
         if (valueA && valueB)
         {
-            if (*valueA == *valueB)
-                replace(function, block, index, {IrCmd::JUMP, inst.c});
-            else
-                replace(function, block, index, {IrCmd::JUMP, inst.d});
-        }
-        break;
-    }
-    case IrCmd::JUMP_LT_INT:
-    {
-        std::optional<int> valueA = function.asIntOp(inst.a.kind == IrOpKind::Constant ? inst.a : state.tryGetValue(inst.a));
-        std::optional<int> valueB = function.asIntOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b));
-
-        if (valueA && valueB)
-        {
-            if (*valueA < *valueB)
-                replace(function, block, index, {IrCmd::JUMP, inst.c});
-            else
-                replace(function, block, index, {IrCmd::JUMP, inst.d});
-        }
-        break;
-    }
-    case IrCmd::JUMP_GE_UINT:
-    {
-        std::optional<unsigned> valueA = function.asUintOp(inst.a.kind == IrOpKind::Constant ? inst.a : state.tryGetValue(inst.a));
-        std::optional<unsigned> valueB = function.asUintOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b));
-
-        if (valueA && valueB)
-        {
-            if (*valueA >= *valueB)
+            if (compare(*valueA, *valueB, conditionOp(inst.c)))
                 replace(function, block, index, {IrCmd::JUMP, inst.c});
             else
                 replace(function, block, index, {IrCmd::JUMP, inst.d});
@@ -644,14 +952,73 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         }
         break;
     }
+    case IrCmd::JUMP_FORN_LOOP_COND:
+    {
+        std::optional<double> step = function.asDoubleOp(inst.c.kind == IrOpKind::Constant ? inst.c : state.tryGetValue(inst.c));
+
+        if (!step)
+            break;
+
+        std::optional<double> idx = function.asDoubleOp(inst.a.kind == IrOpKind::Constant ? inst.a : state.tryGetValue(inst.a));
+        std::optional<double> limit = function.asDoubleOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b));
+
+        if (*step > 0)
+        {
+            if (idx && limit)
+            {
+                if (compare(*idx, *limit, IrCondition::NotLessEqual))
+                    replace(function, block, index, {IrCmd::JUMP, inst.e});
+                else
+                    replace(function, block, index, {IrCmd::JUMP, inst.d});
+            }
+            else
+            {
+                replace(function, block, index, IrInst{IrCmd::JUMP_CMP_NUM, inst.a, inst.b, build.cond(IrCondition::NotLessEqual), inst.e, inst.d});
+            }
+        }
+        else
+        {
+            if (idx && limit)
+            {
+                if (compare(*limit, *idx, IrCondition::NotLessEqual))
+                    replace(function, block, index, {IrCmd::JUMP, inst.e});
+                else
+                    replace(function, block, index, {IrCmd::JUMP, inst.d});
+            }
+            else
+            {
+                replace(function, block, index, IrInst{IrCmd::JUMP_CMP_NUM, inst.b, inst.a, build.cond(IrCondition::NotLessEqual), inst.e, inst.d});
+            }
+        }
+        break;
+    }
     case IrCmd::GET_UPVALUE:
         state.invalidate(inst.a);
+        break;
+    case IrCmd::SET_UPVALUE:
+        if (inst.b.kind == IrOpKind::VmReg)
+        {
+            if (uint8_t tag = state.tryGetTag(inst.b); tag != 0xff)
+            {
+                replace(function, inst.c, build.constTag(tag));
+            }
+        }
         break;
     case IrCmd::CHECK_TAG:
     {
         uint8_t b = function.tagOp(inst.b);
+        uint8_t tag = state.tryGetTag(inst.a);
 
-        if (uint8_t tag = state.tryGetTag(inst.a); tag != 0xff)
+        if (tag == 0xff)
+        {
+            if (IrOp value = state.tryGetValue(inst.a); value.kind == IrOpKind::Constant)
+            {
+                if (function.constOp(value).kind == IrConstKind::Double)
+                    tag = LUA_TNUMBER;
+            }
+        }
+
+        if (tag != 0xff)
         {
             if (tag == b)
             {
@@ -671,6 +1038,9 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         }
         break;
     }
+    case IrCmd::CHECK_TRUTHY:
+        // It is possible to check if current tag in state is truthy or not, but this case almost never comes up
+        break;
     case IrCmd::CHECK_READONLY:
         if (RegisterInfo* info = state.tryGetRegisterInfo(inst.a))
         {
@@ -716,12 +1086,118 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
             state.inSafeEnv = true;
         }
         break;
+    case IrCmd::CHECK_BUFFER_LEN:
+    {
+        std::optional<int> bufferOffset = function.asIntOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b));
+        int accessSize = function.intOp(inst.c);
+        CODEGEN_ASSERT(accessSize > 0);
+
+        if (bufferOffset)
+        {
+            // Negative offsets and offsets overflowing signed integer will jump to fallback, no need to keep the check
+            if (*bufferOffset < 0 || unsigned(*bufferOffset) + unsigned(accessSize) >= unsigned(INT_MAX))
+            {
+                replace(function, block, index, {IrCmd::JUMP, inst.d});
+                break;
+            }
+        }
+
+        for (uint32_t prevIdx : state.checkBufferLenCache)
+        {
+            IrInst& prev = function.instructions[prevIdx];
+
+            if (prev.a != inst.a || prev.c != inst.c)
+                continue;
+
+            if (prev.b == inst.b)
+            {
+                if (FFlag::DebugLuauAbortingChecks)
+                    replace(function, inst.d, build.undef());
+                else
+                    kill(function, inst);
+                return; // Break out from both the loop and the switch
+            }
+            else if (inst.b.kind == IrOpKind::Constant && prev.b.kind == IrOpKind::Constant)
+            {
+                // If arguments are different constants, we can check if a larger bound was already tested or if the previous bound can be raised
+                int currBound = function.intOp(inst.b);
+                int prevBound = function.intOp(prev.b);
+
+                // Negative and overflowing constant offsets should already be replaced with unconditional jumps to a fallback
+                CODEGEN_ASSERT(currBound >= 0);
+                CODEGEN_ASSERT(prevBound >= 0);
+
+                if (unsigned(currBound) >= unsigned(prevBound))
+                    replace(function, prev.b, inst.b);
+
+                if (FFlag::DebugLuauAbortingChecks)
+                    replace(function, inst.d, build.undef());
+                else
+                    kill(function, inst);
+
+                return; // Break out from both the loop and the switch
+            }
+        }
+
+        if (int(state.checkBufferLenCache.size()) < FInt::LuauCodeGenReuseSlotLimit)
+            state.checkBufferLenCache.push_back(index);
+        break;
+    }
+    case IrCmd::CHECK_USERDATA_TAG:
+    {
+        for (uint32_t prevIdx : state.useradataTagCache)
+        {
+            IrInst& prev = function.instructions[prevIdx];
+
+            if (prev.cmd == IrCmd::CHECK_USERDATA_TAG)
+            {
+                if (prev.a != inst.a || prev.b != inst.b)
+                    continue;
+            }
+            else if (prev.cmd == IrCmd::NEW_USERDATA)
+            {
+                if (inst.a.kind != IrOpKind::Inst || prevIdx != inst.a.index || prev.b != inst.b)
+                    continue;
+            }
+
+            if (FFlag::DebugLuauAbortingChecks)
+                replace(function, inst.c, build.undef());
+            else
+                kill(function, inst);
+
+            return; // Break out from both the loop and the switch
+        }
+
+        if (int(state.useradataTagCache.size()) < FInt::LuauCodeGenReuseUdataTagLimit)
+            state.useradataTagCache.push_back(index);
+        break;
+    }
+    case IrCmd::BUFFER_READI8:
+    case IrCmd::BUFFER_READU8:
+    case IrCmd::BUFFER_WRITEI8:
+    case IrCmd::BUFFER_READI16:
+    case IrCmd::BUFFER_READU16:
+    case IrCmd::BUFFER_WRITEI16:
+    case IrCmd::BUFFER_READI32:
+    case IrCmd::BUFFER_WRITEI32:
+    case IrCmd::BUFFER_READF32:
+    case IrCmd::BUFFER_WRITEF32:
+    case IrCmd::BUFFER_READF64:
+    case IrCmd::BUFFER_WRITEF64:
+        break;
     case IrCmd::CHECK_GC:
         // It is enough to perform a GC check once in a block
         if (state.checkedGc)
+        {
             kill(function, inst);
+        }
         else
+        {
             state.checkedGc = true;
+
+            // GC assist might modify table data (hash part)
+            state.invalidateHeapTableData();
+        }
         break;
     case IrCmd::BARRIER_OBJ:
     case IrCmd::BARRIER_TABLE_FORWARD:
@@ -732,31 +1208,170 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
                 // If the written object is not collectable, barrier is not required
                 if (!isGCO(tag))
                     kill(function, inst);
+                else
+                    replace(function, inst.c, build.constTag(tag));
             }
         }
         break;
 
-        // TODO: FASTCALL is more restrictive than INVOKE_FASTCALL; we should either determine the exact semantics, or rework it
     case IrCmd::FASTCALL:
+    {
+        LuauBuiltinFunction bfid = LuauBuiltinFunction(function.uintOp(inst.a));
+        int firstReturnReg = vmRegOp(inst.b);
+        int nresults = function.intOp(inst.d);
+
+        // TODO: FASTCALL is more restrictive than INVOKE_FASTCALL; we should either determine the exact semantics, or rework it
+        handleBuiltinEffects(state, bfid, firstReturnReg, nresults);
+
+        switch (bfid)
+        {
+        case LBF_MATH_MODF:
+        case LBF_MATH_FREXP:
+            state.updateTag(IrOp{IrOpKind::VmReg, uint8_t(firstReturnReg)}, LUA_TNUMBER);
+
+            if (nresults > 1)
+                state.updateTag(IrOp{IrOpKind::VmReg, uint8_t(firstReturnReg + 1)}, LUA_TNUMBER);
+            break;
+        default:
+            break;
+        }
+        break;
+    }
     case IrCmd::INVOKE_FASTCALL:
-        handleBuiltinEffects(state, LuauBuiltinFunction(function.uintOp(inst.a)), vmRegOp(inst.b), function.intOp(inst.f));
+        handleBuiltinEffects(state, LuauBuiltinFunction(function.uintOp(inst.a)), vmRegOp(inst.b), function.intOp(inst.g));
         break;
 
         // These instructions don't have an effect on register/memory state we are tracking
     case IrCmd::NOP:
-    case IrCmd::LOAD_NODE_VALUE_TV:
-    case IrCmd::STORE_NODE_VALUE_TV:
     case IrCmd::LOAD_ENV:
+        break;
     case IrCmd::GET_ARR_ADDR:
+        for (uint32_t prevIdx : state.getArrAddrCache)
+        {
+            const IrInst& prev = function.instructions[prevIdx];
+
+            if (prev.a == inst.a && prev.b == inst.b)
+            {
+                substitute(function, inst, IrOp{IrOpKind::Inst, prevIdx});
+                return; // Break out from both the loop and the switch
+            }
+        }
+
+        if (int(state.getArrAddrCache.size()) < FInt::LuauCodeGenReuseSlotLimit)
+            state.getArrAddrCache.push_back(index);
+        break;
     case IrCmd::GET_SLOT_NODE_ADDR:
+        if (FFlag::LuauCodeGenLimitLiveSlotReuse)
+        {
+            for (size_t i = 0; i < state.getSlotNodeCache.size(); i++)
+            {
+                auto&& [prevIdx, num, lastNum] = state.getSlotNodeCache[i];
+
+                const IrInst& prev = function.instructions[prevIdx];
+
+                if (prev.a == inst.a && prev.c == inst.c)
+                {
+                    // Check if this reuse will increase the overall register pressure over the limit
+                    int limit = FInt::LuauCodeGenLiveSlotReuseLimit;
+
+                    if (int(state.getSlotNodeCache.size()) > limit && state.getMaxInternalOverlap(state.getSlotNodeCache, i) > limit)
+                        return;
+
+                    // Update live range of the value from the optimization standpoint
+                    lastNum = state.instPos;
+
+                    substitute(function, inst, IrOp{IrOpKind::Inst, prevIdx});
+                    return; // Break out from both the loop and the switch
+                }
+            }
+
+            if (int(state.getSlotNodeCache.size()) < FInt::LuauCodeGenReuseSlotLimit)
+                state.getSlotNodeCache.push_back({index, state.instPos, state.instPos});
+        }
+        else
+        {
+            for (uint32_t prevIdx : state.getSlotNodeCache_DEPRECATED)
+            {
+                const IrInst& prev = function.instructions[prevIdx];
+
+                if (prev.a == inst.a && prev.c == inst.c)
+                {
+                    substitute(function, inst, IrOp{IrOpKind::Inst, prevIdx});
+                    return; // Break out from both the loop and the switch
+                }
+            }
+
+            if (int(state.getSlotNodeCache_DEPRECATED.size()) < FInt::LuauCodeGenReuseSlotLimit)
+                state.getSlotNodeCache_DEPRECATED.push_back(index);
+        }
+        break;
     case IrCmd::GET_HASH_NODE_ADDR:
+    case IrCmd::GET_CLOSURE_UPVAL_ADDR:
         break;
     case IrCmd::ADD_INT:
     case IrCmd::SUB_INT:
+        state.substituteOrRecord(inst, index);
+        break;
     case IrCmd::ADD_NUM:
     case IrCmd::SUB_NUM:
+        if (FFlag::LuauCodeGenArithOpt)
+        {
+            if (std::optional<double> k = function.asDoubleOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b)))
+            {
+                // a + 0.0 and a - (-0.0) can't be folded since the behavior is different for negative zero
+                // however, a - 0.0 and a + (-0.0) can be folded into a
+                if (*k == 0.0 && bool(signbit(*k)) == (inst.cmd == IrCmd::ADD_NUM))
+                    substitute(function, inst, inst.a);
+                else
+                    state.substituteOrRecord(inst, index);
+            }
+            else
+                state.substituteOrRecord(inst, index);
+        }
+        else
+            state.substituteOrRecord(inst, index);
+        break;
     case IrCmd::MUL_NUM:
+        if (FFlag::LuauCodeGenArithOpt)
+        {
+            if (std::optional<double> k = function.asDoubleOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b)))
+            {
+                if (*k == 1.0) // a * 1.0 = a
+                    substitute(function, inst, inst.a);
+                else if (*k == 2.0) // a * 2.0 = a + a
+                    replace(function, block, index, {IrCmd::ADD_NUM, inst.a, inst.a});
+                else if (*k == -1.0) // a * -1.0 = -a
+                    replace(function, block, index, {IrCmd::UNM_NUM, inst.a});
+                else
+                    state.substituteOrRecord(inst, index);
+            }
+            else
+                state.substituteOrRecord(inst, index);
+        }
+        else
+            state.substituteOrRecord(inst, index);
+        break;
     case IrCmd::DIV_NUM:
+        if (FFlag::LuauCodeGenArithOpt)
+        {
+            if (std::optional<double> k = function.asDoubleOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b)))
+            {
+                if (*k == 1.0) // a / 1.0 = a
+                    substitute(function, inst, inst.a);
+                else if (*k == -1.0) // a / -1.0 = -a
+                    replace(function, block, index, {IrCmd::UNM_NUM, inst.a});
+                else if (int exp = 0; frexp(*k, &exp) == 0.5 && exp >= -1000 && exp <= 1000) // a / 2^k = a * 2^-k
+                    replace(function, block, index, {IrCmd::MUL_NUM, inst.a, build.constDouble(1.0 / *k)});
+                else
+                    state.substituteOrRecord(inst, index);
+            }
+            else
+                state.substituteOrRecord(inst, index);
+        }
+        else
+            state.substituteOrRecord(inst, index);
+        break;
+    case IrCmd::IDIV_NUM:
     case IrCmd::MOD_NUM:
     case IrCmd::MIN_NUM:
     case IrCmd::MAX_NUM:
@@ -766,17 +1381,45 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::ROUND_NUM:
     case IrCmd::SQRT_NUM:
     case IrCmd::ABS_NUM:
+    case IrCmd::SIGN_NUM:
     case IrCmd::NOT_ANY:
         state.substituteOrRecord(inst, index);
+        break;
+    case IrCmd::CMP_ANY:
+        state.invalidateUserCall();
         break;
     case IrCmd::JUMP:
     case IrCmd::JUMP_EQ_POINTER:
     case IrCmd::JUMP_SLOT_MATCH:
     case IrCmd::TABLE_LEN:
+        break;
+    case IrCmd::TABLE_SETNUM:
+        state.invalidateTableArraySize();
+        break;
+    case IrCmd::STRING_LEN:
     case IrCmd::NEW_TABLE:
     case IrCmd::DUP_TABLE:
+        break;
     case IrCmd::TRY_NUM_TO_INDEX:
+        for (uint32_t prevIdx : state.tryNumToIndexCache)
+        {
+            const IrInst& prev = function.instructions[prevIdx];
+
+            if (prev.a == inst.a)
+            {
+                substitute(function, inst, IrOp{IrOpKind::Inst, prevIdx});
+                return; // Break out from both the loop and the switch
+            }
+        }
+
+        if (int(state.tryNumToIndexCache.size()) < FInt::LuauCodeGenReuseSlotLimit)
+            state.tryNumToIndexCache.push_back(index);
+        break;
     case IrCmd::TRY_CALL_FASTGETTM:
+        break;
+    case IrCmd::NEW_USERDATA:
+        if (int(state.useradataTagCache.size()) < FInt::LuauCodeGenReuseUdataTagLimit)
+            state.useradataTagCache.push_back(index);
         break;
     case IrCmd::INT_TO_NUM:
     case IrCmd::UINT_TO_NUM:
@@ -795,12 +1438,108 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
             state.substituteOrRecord(inst, index);
         break;
     case IrCmd::CHECK_ARRAY_SIZE:
+    {
+        std::optional<int> arrayIndex = function.asIntOp(inst.b.kind == IrOpKind::Constant ? inst.b : state.tryGetValue(inst.b));
+
+        // Negative offsets will jump to fallback, no need to keep the check
+        if (arrayIndex && *arrayIndex < 0)
+        {
+            replace(function, block, index, {IrCmd::JUMP, inst.c});
+            break;
+        }
+
+        if (RegisterInfo* info = state.tryGetRegisterInfo(inst.a); info && arrayIndex)
+        {
+            if (info->knownTableArraySize >= 0)
+            {
+                if (unsigned(*arrayIndex) < unsigned(info->knownTableArraySize))
+                {
+                    if (FFlag::DebugLuauAbortingChecks)
+                        replace(function, inst.c, build.undef());
+                    else
+                        kill(function, inst);
+                }
+                else
+                {
+                    replace(function, block, index, {IrCmd::JUMP, inst.c});
+                }
+
+                break;
+            }
+        }
+
+        for (uint32_t prevIdx : state.checkArraySizeCache)
+        {
+            const IrInst& prev = function.instructions[prevIdx];
+
+            if (prev.a != inst.a)
+                continue;
+
+            bool sameBoundary = prev.b == inst.b;
+
+            // If arguments are different, in case they are both constant, we can check if a larger bound was already tested
+            if (!sameBoundary && inst.b.kind == IrOpKind::Constant && prev.b.kind == IrOpKind::Constant &&
+                unsigned(function.intOp(inst.b)) < unsigned(function.intOp(prev.b)))
+                sameBoundary = true;
+
+            if (sameBoundary)
+            {
+                if (FFlag::DebugLuauAbortingChecks)
+                    replace(function, inst.c, build.undef());
+                else
+                    kill(function, inst);
+                return; // Break out from both the loop and the switch
+            }
+
+            // TODO: it should be possible to update previous check with a higher bound if current and previous checks are against a constant
+        }
+
+        if (int(state.checkArraySizeCache.size()) < FInt::LuauCodeGenReuseSlotLimit)
+            state.checkArraySizeCache.push_back(index);
+        break;
+    }
     case IrCmd::CHECK_SLOT_MATCH:
+        for (uint32_t prevIdx : state.checkSlotMatchCache)
+        {
+            const IrInst& prev = function.instructions[prevIdx];
+
+            if (prev.a == inst.a && prev.b == inst.b)
+            {
+                // Only a check for 'nil' value is left
+                replace(function, block, index, {IrCmd::CHECK_NODE_VALUE, inst.a, inst.c});
+                return; // Break out from both the loop and the switch
+            }
+        }
+
+        if (int(state.checkSlotMatchCache.size()) < FInt::LuauCodeGenReuseSlotLimit)
+            state.checkSlotMatchCache.push_back(index);
+        break;
+
+    case IrCmd::ADD_VEC:
+    case IrCmd::SUB_VEC:
+    case IrCmd::MUL_VEC:
+    case IrCmd::DIV_VEC:
+    case IrCmd::DOT_VEC:
+        if (inst.cmd == IrCmd::DOT_VEC)
+            LUAU_ASSERT(FFlag::LuauVectorLibNativeDot);
+
+        if (IrInst* a = function.asInstOp(inst.a); a && a->cmd == IrCmd::TAG_VECTOR)
+            replace(function, inst.a, a->a);
+
+        if (IrInst* b = function.asInstOp(inst.b); b && b->cmd == IrCmd::TAG_VECTOR)
+            replace(function, inst.b, b->a);
+        break;
+
+    case IrCmd::UNM_VEC:
+        if (IrInst* a = function.asInstOp(inst.a); a && a->cmd == IrCmd::TAG_VECTOR)
+            replace(function, inst.a, a->a);
+        break;
+
     case IrCmd::CHECK_NODE_NO_NEXT:
+    case IrCmd::CHECK_NODE_VALUE:
     case IrCmd::BARRIER_TABLE_BACK:
     case IrCmd::RETURN:
     case IrCmd::COVERAGE:
-    case IrCmd::SET_UPVALUE:
     case IrCmd::SET_SAVEDPC:  // TODO: we may be able to remove some updates to PC
     case IrCmd::CLOSE_UPVALS: // Doesn't change memory that we track
     case IrCmd::CAPTURE:
@@ -819,12 +1558,15 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::BITLROTATE_UINT:
     case IrCmd::BITCOUNTLZ_UINT:
     case IrCmd::BITCOUNTRZ_UINT:
+    case IrCmd::BYTESWAP_UINT:
     case IrCmd::INVOKE_LIBM:
+    case IrCmd::GET_TYPE:
+    case IrCmd::GET_TYPEOF:
+    case IrCmd::FINDUPVAL:
+    case IrCmd::NUM_TO_VEC:
+    case IrCmd::TAG_VECTOR:
         break;
 
-    case IrCmd::JUMP_CMP_ANY:
-        state.invalidateUserCall(); // TODO: if arguments are strings, there will be no user calls
-        break;
     case IrCmd::DO_ARITH:
         state.invalidate(inst.a);
         state.invalidateUserCall();
@@ -850,32 +1592,34 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         state.invalidateRegisterRange(vmRegOp(inst.a), function.uintOp(inst.b));
         state.invalidateUserCall(); // TODO: if only strings and numbers are concatenated, there will be no user calls
         break;
-    case IrCmd::PREPARE_FORN:
-        state.invalidateValue(inst.a);
-        state.saveTag(inst.a, LUA_TNUMBER);
-        state.invalidateValue(inst.b);
-        state.saveTag(inst.b, LUA_TNUMBER);
-        state.invalidateValue(inst.c);
-        state.saveTag(inst.c, LUA_TNUMBER);
-        break;
     case IrCmd::INTERRUPT:
         state.invalidateUserCall();
         break;
     case IrCmd::SETLIST:
-        state.valueMap.clear(); // TODO: this can be relaxed when x64 emitInstSetList becomes aware of register allocator
+        if (RegisterInfo* info = state.tryGetRegisterInfo(inst.b); info && info->knownTableArraySize >= 0)
+            replace(function, inst.f, build.constUint(info->knownTableArraySize));
+
+        // TODO: this can be relaxed when x64 emitInstSetList becomes aware of register allocator
+        state.invalidateValuePropagation();
+        state.invalidateHeapTableData();
+        state.invalidateHeapBufferData();
         break;
     case IrCmd::CALL:
         state.invalidateRegistersFrom(vmRegOp(inst.a));
         state.invalidateUserCall();
 
-        // We cannot guarantee right now that all live values can be remeterialized from non-stack memory locations
+        // We cannot guarantee right now that all live values can be rematerialized from non-stack memory locations
         // To prevent earlier values from being propagated to after the call, we have to clear the map
         // TODO: remove only the values that don't have a guaranteed restore location
-        state.valueMap.clear();
+        state.invalidateValuePropagation();
         break;
     case IrCmd::FORGLOOP:
         state.invalidateRegistersFrom(vmRegOp(inst.a) + 2); // Rn and Rn+1 are not modified
-        state.valueMap.clear();                             // TODO: this can be relaxed when x64 emitInstForGLoop becomes aware of register allocator
+
+        // TODO: this can be relaxed when x64 emitInstForGLoop becomes aware of register allocator
+        state.invalidateValuePropagation();
+        state.invalidateHeapTableData();
+        state.invalidateHeapBufferData();
         break;
     case IrCmd::FORGLOOP_FALLBACK:
         state.invalidateRegistersFrom(vmRegOp(inst.a) + 2); // Rn and Rn+1 are not modified
@@ -910,8 +1654,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
     case IrCmd::FALLBACK_GETVARARGS:
         state.invalidateRegisterRange(vmRegOp(inst.b), function.intOp(inst.c));
         break;
-    case IrCmd::FALLBACK_NEWCLOSURE:
-        state.invalidate(inst.b);
+    case IrCmd::NEWCLOSURE:
         break;
     case IrCmd::FALLBACK_DUPCLOSURE:
         state.invalidate(inst.b);
@@ -920,6 +1663,7 @@ static void constPropInInst(ConstPropState& state, IrBuilder& build, IrFunction&
         state.invalidate(IrOp{inst.b.kind, vmRegOp(inst.b) + 0u});
         state.invalidate(IrOp{inst.b.kind, vmRegOp(inst.b) + 1u});
         state.invalidate(IrOp{inst.b.kind, vmRegOp(inst.b) + 2u});
+        state.invalidateUserCall();
         break;
     }
 }
@@ -930,7 +1674,7 @@ static void constPropInBlock(IrBuilder& build, IrBlock& block, ConstPropState& s
 
     for (uint32_t index = block.start; index <= block.finish; index++)
     {
-        LUAU_ASSERT(index < function.instructions.size());
+        CODEGEN_ASSERT(index < function.instructions.size());
         IrInst& inst = function.instructions[index];
 
         applySubstitutions(function, inst);
@@ -939,9 +1683,6 @@ static void constPropInBlock(IrBuilder& build, IrBlock& block, ConstPropState& s
 
         constPropInInst(state, build, function, block, inst, index);
     }
-
-    // Value numbering and load/store propagation is not performed between blocks
-    state.valueMap.clear();
 }
 
 static void constPropInBlockChain(IrBuilder& build, std::vector<uint8_t>& visited, IrBlock* block, ConstPropState& state)
@@ -950,13 +1691,29 @@ static void constPropInBlockChain(IrBuilder& build, std::vector<uint8_t>& visite
 
     state.clear();
 
+    const uint32_t startSortkey = block->sortkey;
+    uint32_t chainPos = 0;
+
     while (block)
     {
         uint32_t blockIdx = function.getBlockIndex(*block);
-        LUAU_ASSERT(!visited[blockIdx]);
+        CODEGEN_ASSERT(!visited[blockIdx]);
         visited[blockIdx] = true;
 
         constPropInBlock(build, *block, state);
+
+        // Value numbering and load/store propagation is not performed between blocks
+        state.invalidateValuePropagation();
+
+        // Same for table and buffer data propagation
+        state.invalidateHeapTableData();
+        state.invalidateHeapBufferData();
+        state.invalidateUserdataData();
+
+        // Blocks in a chain are guaranteed to follow each other
+        // We force that by giving all blocks the same sorting key, but consecutive chain keys
+        block->sortkey = startSortkey;
+        block->chainkey = chainPos++;
 
         IrInst& termInst = function.instructions[block->finish];
 
@@ -964,13 +1721,21 @@ static void constPropInBlockChain(IrBuilder& build, std::vector<uint8_t>& visite
 
         // Unconditional jump into a block with a single user (current block) allows us to continue optimization
         // with the information we have gathered so far (unless we have already visited that block earlier)
-        if (termInst.cmd == IrCmd::JUMP)
+        if (termInst.cmd == IrCmd::JUMP && termInst.a.kind == IrOpKind::Block)
         {
             IrBlock& target = function.blockOp(termInst.a);
             uint32_t targetIdx = function.getBlockIndex(target);
 
             if (target.useCount == 1 && !visited[targetIdx] && target.kind != IrBlockKind::Fallback)
+            {
+                if (getLiveOutValueCount(function, target) != 0)
+                    break;
+
+                // Make sure block ordering guarantee is checked at lowering time
+                block->expectedNextBlock = function.getBlockIndex(target);
+
                 nextBlock = &target;
+            }
         }
 
         block = nextBlock;
@@ -988,7 +1753,7 @@ static std::vector<uint32_t> collectDirectBlockJumpPath(IrFunction& function, st
     // Usually that would mean that we would have a conditional jump at the end of 'block'
     // But using check guards and fallback blocks it becomes a possible setup
     // We avoid this by making sure fallbacks rejoin the other immediate successor of 'block'
-    LUAU_ASSERT(getLiveOutValueCount(function, *block) == 0);
+    CODEGEN_ASSERT(getLiveOutValueCount(function, *block) == 0);
 
     std::vector<uint32_t> path;
 
@@ -998,7 +1763,7 @@ static std::vector<uint32_t> collectDirectBlockJumpPath(IrFunction& function, st
         IrBlock* nextBlock = nullptr;
 
         // A chain is made from internal blocks that were not a part of bytecode CFG
-        if (termInst.cmd == IrCmd::JUMP)
+        if (termInst.cmd == IrCmd::JUMP && termInst.a.kind == IrOpKind::Block)
         {
             IrBlock& target = function.blockOp(termInst.a);
             uint32_t targetIdx = function.getBlockIndex(target);
@@ -1030,13 +1795,17 @@ static void tryCreateLinearBlock(IrBuilder& build, std::vector<uint8_t>& visited
     IrFunction& function = build.function;
 
     uint32_t blockIdx = function.getBlockIndex(startingBlock);
-    LUAU_ASSERT(!visited[blockIdx]);
+    CODEGEN_ASSERT(!visited[blockIdx]);
     visited[blockIdx] = true;
 
     IrInst& termInst = function.instructions[startingBlock.finish];
 
     // Block has to end with an unconditional jump
     if (termInst.cmd != IrCmd::JUMP)
+        return;
+
+    // And it can't be jump to a VM exit or undef
+    if (termInst.a.kind != IrOpKind::Block)
         return;
 
     // And it has to jump to a block with more than one user
@@ -1056,18 +1825,28 @@ static void tryCreateLinearBlock(IrBuilder& build, std::vector<uint8_t>& visited
     // Initialize state with the knowledge of our current block
     state.clear();
 
-    // TODO: using values from the first block can cause 'live out' of the linear block predecessor to not have all required registers
     constPropInBlock(build, startingBlock, state);
 
-    // Veryfy that target hasn't changed
-    LUAU_ASSERT(function.instructions[startingBlock.finish].a.index == targetBlockIdx);
+    // Verify that target hasn't changed
+    CODEGEN_ASSERT(function.instructions[startingBlock.finish].a.index == targetBlockIdx);
+
+    // Note: using startingBlock after this line is unsafe as the reference may be reallocated by build.block() below
+    const uint32_t startingSortKey = startingBlock.sortkey;
+    const uint32_t startingChainKey = startingBlock.chainkey;
 
     // Create new linearized block into which we are going to redirect starting block jump
     IrOp newBlock = build.block(IrBlockKind::Linearized);
     visited.push_back(false);
 
-    // TODO: placement of linear blocks in final lowering is sub-optimal, it should follow our predecessor
     build.beginBlock(newBlock);
+
+    // By default, blocks are ordered according to start instruction; we alter sort order to make sure linearized block is placed right after the
+    // starting block
+    function.blocks[newBlock.index].sortkey = startingSortKey;
+    function.blocks[newBlock.index].chainkey = startingChainKey + 1;
+
+    // Make sure block ordering guarantee is checked at lowering time
+    function.blocks[blockIdx].expectedNextBlock = newBlock.index;
 
     replace(function, termInst.a, newBlock);
 
@@ -1080,8 +1859,8 @@ static void tryCreateLinearBlock(IrBuilder& build, std::vector<uint8_t>& visited
     // The information generated here is consistent with current state that could be outdated, but still useful in IR inspection
     if (function.cfg.in.size() == newBlock.index)
     {
-        LUAU_ASSERT(function.cfg.in.size() == function.cfg.out.size());
-        LUAU_ASSERT(function.cfg.in.size() == function.cfg.def.size());
+        CODEGEN_ASSERT(function.cfg.in.size() == function.cfg.out.size());
+        CODEGEN_ASSERT(function.cfg.in.size() == function.cfg.def.size());
 
         // Live in is the same as the input of the original first block
         function.cfg.in.push_back(function.cfg.in[path.front()]);
@@ -1106,6 +1885,12 @@ static void tryCreateLinearBlock(IrBuilder& build, std::vector<uint8_t>& visited
                 def.varargStart = pathDef.varargStart;
             }
         }
+
+        // Update predecessors
+        function.cfg.predecessorsOffsets.push_back(uint32_t(function.cfg.predecessors.size()));
+        function.cfg.predecessors.push_back(blockIdx);
+
+        // Updating successors will require visiting the instructions again and we don't have a current use for linearized block successor list
     }
 
     // Optimize our linear block

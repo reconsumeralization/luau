@@ -33,10 +33,28 @@ inline bool luai_vecisnan(const float* a)
 #endif
 }
 
+inline float luaui_signf(float v)
+{
+    return v > 0.0f ? 1.0f : v < 0.0f ? -1.0f : 0.0f;
+}
+
+inline float luaui_clampf(float v, float min, float max)
+{
+    float r = v < min ? min : v;
+    return r > max ? max : r;
+}
+
 LUAU_FASTMATH_BEGIN
 inline double luai_nummod(double a, double b)
 {
     return a - floor(a / b) * b;
+}
+LUAU_FASTMATH_END
+
+LUAU_FASTMATH_BEGIN
+inline double luai_numidiv(double a, double b)
+{
+    return floor(a / b);
 }
 LUAU_FASTMATH_END
 
