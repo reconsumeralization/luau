@@ -5,7 +5,8 @@
 
 #include <stdarg.h>
 #include <stdio.h>
-#include <string.h>
+
+LUAU_FASTFLAG(LuauVectorLibNativeDot);
 
 namespace Luau
 {
@@ -16,17 +17,23 @@ namespace X64
 
 // TODO: more assertions on operand sizes
 
-static const uint8_t codeForCondition[] = {
-    0x0, 0x1, 0x2, 0x3, 0x2, 0x6, 0x7, 0x3, 0x4, 0xc, 0xe, 0xf, 0xd, 0x3, 0x7, 0x6, 0x2, 0x5, 0xd, 0xf, 0xe, 0xc, 0x4, 0x5, 0xa, 0xb};
+static const uint8_t codeForCondition[] = {0x0, 0x1, 0x2, 0x3, 0x2, 0x6, 0x7, 0x3, 0x4, 0xc, 0xe, 0xf, 0xd,
+                                           0x3, 0x7, 0x6, 0x2, 0x5, 0xd, 0xf, 0xe, 0xc, 0x4, 0x5, 0xa, 0xb};
 static_assert(sizeof(codeForCondition) / sizeof(codeForCondition[0]) == size_t(ConditionX64::Count), "all conditions have to be covered");
 
-static const char* jccTextForCondition[] = {"jo", "jno", "jc", "jnc", "jb", "jbe", "ja", "jae", "je", "jl", "jle", "jg", "jge", "jnb", "jnbe", "jna",
-    "jnae", "jne", "jnl", "jnle", "jng", "jnge", "jz", "jnz", "jp", "jnp"};
+static const char* jccTextForCondition[] = {"jo",  "jno",  "jc",  "jnc",  "jb",  "jbe", "ja",   "jae", "je",   "jl", "jle", "jg", "jge",
+                                            "jnb", "jnbe", "jna", "jnae", "jne", "jnl", "jnle", "jng", "jnge", "jz", "jnz", "jp", "jnp"};
 static_assert(sizeof(jccTextForCondition) / sizeof(jccTextForCondition[0]) == size_t(ConditionX64::Count), "all conditions have to be covered");
 
-static const char* setccTextForCondition[] = {"seto", "setno", "setc", "setnc", "setb", "setbe", "seta", "setae", "sete", "setl", "setle", "setg",
-    "setge", "setnb", "setnbe", "setna", "setnae", "setne", "setnl", "setnle", "setng", "setnge", "setz", "setnz", "setp", "setnp"};
+static const char* setccTextForCondition[] = {"seto",  "setno",  "setc",  "setnc",  "setb",  "setbe",  "seta",  "setae",  "sete",
+                                              "setl",  "setle",  "setg",  "setge",  "setnb", "setnbe", "setna", "setnae", "setne",
+                                              "setnl", "setnle", "setng", "setnge", "setz",  "setnz",  "setp",  "setnp"};
 static_assert(sizeof(setccTextForCondition) / sizeof(setccTextForCondition[0]) == size_t(ConditionX64::Count), "all conditions have to be covered");
+
+static const char* cmovTextForCondition[] = {"cmovo",  "cmovno",  "cmovc",  "cmovnc",  "cmovb",  "cmovbe",  "cmova",  "cmovae",  "cmove",
+                                             "cmovl",  "cmovle",  "cmovg",  "cmovge",  "cmovnb", "cmovnbe", "cmovna", "cmovnae", "cmovne",
+                                             "cmovnl", "cmovnle", "cmovng", "cmovnge", "cmovz",  "cmovnz",  "cmovp",  "cmovnp"};
+static_assert(sizeof(cmovTextForCondition) / sizeof(cmovTextForCondition[0]) == size_t(ConditionX64::Count), "all conditions have to be covered");
 
 #define OP_PLUS_REG(op, reg) ((op) + (reg & 0x7))
 #define OP_PLUS_CC(op, cc) ((op) + uint8_t(cc))
@@ -46,8 +53,8 @@ static_assert(sizeof(setccTextForCondition) / sizeof(setccTextForCondition[0]) =
 #define AVX_3_2(r, x, b, m) (AVX_R(r) | AVX_X(x) | AVX_B(b) | (m))
 #define AVX_3_3(w, v, l, p) (AVX_W(w) | ((~(v.index) & 0xf) << 3) | ((l) << 2) | (p))
 
-#define MOD_RM(mod, reg, rm) (((mod) << 6) | (((reg)&0x7) << 3) | ((rm)&0x7))
-#define SIB(scale, index, base) ((getScaleEncoding(scale) << 6) | (((index)&0x7) << 3) | ((base)&0x7))
+#define MOD_RM(mod, reg, rm) (((mod) << 6) | (((reg) & 0x7) << 3) | ((rm) & 0x7))
+#define SIB(scale, index, base) ((getScaleEncoding(scale) << 6) | (((index) & 0x7) << 3) | ((base) & 0x7))
 
 const unsigned AVX_0F = 0b0001;
 [[maybe_unused]] const unsigned AVX_0F38 = 0b0010;
@@ -75,6 +82,7 @@ static ABIX64 getCurrentX64ABI()
 AssemblyBuilderX64::AssemblyBuilderX64(bool logText, ABIX64 abi)
     : logText(logText)
     , abi(abi)
+    , constCache32(~0u)
     , constCache64(~0ull)
 {
     data.resize(4096);
@@ -92,7 +100,7 @@ AssemblyBuilderX64::AssemblyBuilderX64(bool logText)
 
 AssemblyBuilderX64::~AssemblyBuilderX64()
 {
-    LUAU_ASSERT(finalized);
+    CODEGEN_ASSERT(finalized);
 }
 
 void AssemblyBuilderX64::add(OperandX64 lhs, OperandX64 rhs)
@@ -171,6 +179,12 @@ void AssemblyBuilderX64::mov(OperandX64 lhs, OperandX64 rhs)
             place(OP_PLUS_REG(0xb0, lhs.base.index));
             placeImm8(rhs.imm);
         }
+        else if (size == SizeX64::word)
+        {
+            place(0x66);
+            place(OP_PLUS_REG(0xb8, lhs.base.index));
+            placeImm16(rhs.imm);
+        }
         else if (size == SizeX64::dword)
         {
             place(OP_PLUS_REG(0xb8, lhs.base.index));
@@ -178,7 +192,7 @@ void AssemblyBuilderX64::mov(OperandX64 lhs, OperandX64 rhs)
         }
         else
         {
-            LUAU_ASSERT(size == SizeX64::qword);
+            CODEGEN_ASSERT(size == SizeX64::qword);
 
             place(OP_PLUS_REG(0xb8, lhs.base.index));
             placeImm64(rhs.imm);
@@ -196,9 +210,16 @@ void AssemblyBuilderX64::mov(OperandX64 lhs, OperandX64 rhs)
             placeModRegMem(lhs, 0, /*extraCodeBytes=*/1);
             placeImm8(rhs.imm);
         }
+        else if (size == SizeX64::word)
+        {
+            place(0x66);
+            place(0xc7);
+            placeModRegMem(lhs, 0, /*extraCodeBytes=*/2);
+            placeImm16(rhs.imm);
+        }
         else
         {
-            LUAU_ASSERT(size == SizeX64::dword || size == SizeX64::qword);
+            CODEGEN_ASSERT(size == SizeX64::dword || size == SizeX64::qword);
 
             place(0xc7);
             placeModRegMem(lhs, 0, /*extraCodeBytes=*/4);
@@ -215,7 +236,7 @@ void AssemblyBuilderX64::mov(OperandX64 lhs, OperandX64 rhs)
     }
     else
     {
-        LUAU_ASSERT(!"No encoding for this operand combination");
+        CODEGEN_ASSERT(!"No encoding for this operand combination");
     }
 
     commit();
@@ -230,7 +251,7 @@ void AssemblyBuilderX64::mov64(RegisterX64 lhs, int64_t imm)
         logAppend(",%llXh\n", (unsigned long long)imm);
     }
 
-    LUAU_ASSERT(lhs.size == SizeX64::qword);
+    CODEGEN_ASSERT(lhs.size == SizeX64::qword);
 
     placeRex(lhs);
     place(OP_PLUS_REG(0xb8, lhs.index));
@@ -243,7 +264,7 @@ void AssemblyBuilderX64::movsx(RegisterX64 lhs, OperandX64 rhs)
     if (logText)
         log("movsx", lhs, rhs);
 
-    LUAU_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
+    CODEGEN_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
 
     placeRex(lhs, rhs);
     place(0x0f);
@@ -257,7 +278,7 @@ void AssemblyBuilderX64::movzx(RegisterX64 lhs, OperandX64 rhs)
     if (logText)
         log("movzx", lhs, rhs);
 
-    LUAU_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
+    CODEGEN_ASSERT(rhs.memSize == SizeX64::byte || rhs.memSize == SizeX64::word);
 
     placeRex(lhs, rhs);
     place(0x0f);
@@ -352,9 +373,9 @@ void AssemblyBuilderX64::lea(OperandX64 lhs, OperandX64 rhs)
     if (logText)
         log("lea", lhs, rhs);
 
-    LUAU_ASSERT(lhs.cat == CategoryX64::reg && rhs.cat == CategoryX64::mem && rhs.memSize == SizeX64::none);
-    LUAU_ASSERT(rhs.base == rip || rhs.base.size == lhs.base.size);
-    LUAU_ASSERT(rhs.index == noreg || rhs.index.size == lhs.base.size);
+    CODEGEN_ASSERT(lhs.cat == CategoryX64::reg && rhs.cat == CategoryX64::mem && rhs.memSize == SizeX64::none);
+    CODEGEN_ASSERT(rhs.base == rip || rhs.base.size == lhs.base.size);
+    CODEGEN_ASSERT(rhs.index == noreg || rhs.index.size == lhs.base.size);
     rhs.memSize = lhs.base.size;
     placeBinaryRegAndRegMem(lhs, rhs, 0x8d, 0x8d);
 }
@@ -364,7 +385,7 @@ void AssemblyBuilderX64::push(OperandX64 op)
     if (logText)
         log("push", op);
 
-    LUAU_ASSERT(op.cat == CategoryX64::reg && op.base.size == SizeX64::qword);
+    CODEGEN_ASSERT(op.cat == CategoryX64::reg && op.base.size == SizeX64::qword);
     placeRex(op.base);
     place(OP_PLUS_REG(0x50, op.base.index));
     commit();
@@ -375,7 +396,7 @@ void AssemblyBuilderX64::pop(OperandX64 op)
     if (logText)
         log("pop", op);
 
-    LUAU_ASSERT(op.cat == CategoryX64::reg && op.base.size == SizeX64::qword);
+    CODEGEN_ASSERT(op.cat == CategoryX64::reg && op.base.size == SizeX64::qword);
     placeRex(op.base);
     place(OP_PLUS_REG(0x58, op.base.index));
     commit();
@@ -393,7 +414,7 @@ void AssemblyBuilderX64::ret()
 void AssemblyBuilderX64::setcc(ConditionX64 cond, OperandX64 op)
 {
     SizeX64 size = op.cat == CategoryX64::reg ? op.base.size : op.memSize;
-    LUAU_ASSERT(size == SizeX64::byte);
+    CODEGEN_ASSERT(size == SizeX64::byte);
 
     if (logText)
         log(setccTextForCondition[size_t(cond)], op);
@@ -402,6 +423,20 @@ void AssemblyBuilderX64::setcc(ConditionX64 cond, OperandX64 op)
     place(0x0f);
     place(0x90 | codeForCondition[size_t(cond)]);
     placeModRegMem(op, 0);
+    commit();
+}
+
+void AssemblyBuilderX64::cmov(ConditionX64 cond, RegisterX64 lhs, OperandX64 rhs)
+{
+    SizeX64 size = rhs.cat == CategoryX64::reg ? rhs.base.size : rhs.memSize;
+    CODEGEN_ASSERT(size != SizeX64::byte && size == lhs.size);
+
+    if (logText)
+        log(cmovTextForCondition[size_t(cond)], lhs, rhs);
+    placeRex(lhs, rhs);
+    place(0x0f);
+    place(0x40 | codeForCondition[size_t(cond)]);
+    placeRegAndModRegMem(lhs, rhs);
     commit();
 }
 
@@ -423,7 +458,7 @@ void AssemblyBuilderX64::jmp(Label& label)
 
 void AssemblyBuilderX64::jmp(OperandX64 op)
 {
-    LUAU_ASSERT((op.cat == CategoryX64::reg ? op.base.size : op.memSize) == SizeX64::qword);
+    CODEGEN_ASSERT((op.cat == CategoryX64::reg ? op.base.size : op.memSize) == SizeX64::qword);
 
     if (logText)
         log("jmp", op);
@@ -450,7 +485,7 @@ void AssemblyBuilderX64::call(Label& label)
 
 void AssemblyBuilderX64::call(OperandX64 op)
 {
-    LUAU_ASSERT((op.cat == CategoryX64::reg ? op.base.size : op.memSize) == SizeX64::qword);
+    CODEGEN_ASSERT((op.cat == CategoryX64::reg ? op.base.size : op.memSize) == SizeX64::qword);
 
     if (logText)
         log("call", op);
@@ -461,6 +496,20 @@ void AssemblyBuilderX64::call(OperandX64 op)
     place(0xff);
     placeModRegMem(op, 2);
     commit();
+}
+
+void AssemblyBuilderX64::lea(RegisterX64 lhs, Label& label)
+{
+    CODEGEN_ASSERT(lhs.size == SizeX64::qword);
+
+    placeBinaryRegAndRegMem(lhs, OperandX64(SizeX64::qword, noreg, 1, rip, 0), 0x8d, 0x8d);
+
+    codePos -= 4;
+    placeLabel(label);
+    commit();
+
+    if (logText)
+        log("lea", lhs, label);
 }
 
 void AssemblyBuilderX64::int3()
@@ -486,7 +535,7 @@ void AssemblyBuilderX64::bsr(RegisterX64 dst, OperandX64 src)
     if (logText)
         log("bsr", dst, src);
 
-    LUAU_ASSERT(dst.size == SizeX64::dword || dst.size == SizeX64::qword);
+    CODEGEN_ASSERT(dst.size == SizeX64::dword || dst.size == SizeX64::qword);
 
     placeRex(dst, src);
     place(0x0f);
@@ -500,12 +549,25 @@ void AssemblyBuilderX64::bsf(RegisterX64 dst, OperandX64 src)
     if (logText)
         log("bsf", dst, src);
 
-    LUAU_ASSERT(dst.size == SizeX64::dword || dst.size == SizeX64::qword);
+    CODEGEN_ASSERT(dst.size == SizeX64::dword || dst.size == SizeX64::qword);
 
     placeRex(dst, src);
     place(0x0f);
     place(0xbc);
     placeRegAndModRegMem(dst, src);
+    commit();
+}
+
+void AssemblyBuilderX64::bswap(RegisterX64 dst)
+{
+    if (logText)
+        log("bswap", dst);
+
+    CODEGEN_ASSERT(dst.size == SizeX64::dword || dst.size == SizeX64::qword);
+
+    placeRex(dst);
+    place(0x0f);
+    place(OP_PLUS_REG(0xc8, dst.index));
     commit();
 }
 
@@ -607,7 +669,7 @@ void AssemblyBuilderX64::nop(uint32_t length)
 
 void AssemblyBuilderX64::align(uint32_t alignment, AlignmentDataX64 data)
 {
-    LUAU_ASSERT((alignment & (alignment - 1)) == 0);
+    CODEGEN_ASSERT((alignment & (alignment - 1)) == 0);
 
     uint32_t size = getCodeSize();
     uint32_t pad = ((size + alignment - 1) & ~(alignment - 1)) - size;
@@ -680,14 +742,34 @@ void AssemblyBuilderX64::vsubsd(OperandX64 dst, OperandX64 src1, OperandX64 src2
     placeAvx("vsubsd", dst, src1, src2, 0x5c, false, AVX_0F, AVX_F2);
 }
 
+void AssemblyBuilderX64::vsubps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vsubps", dst, src1, src2, 0x5c, false, AVX_0F, AVX_NP);
+}
+
 void AssemblyBuilderX64::vmulsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vmulsd", dst, src1, src2, 0x59, false, AVX_0F, AVX_F2);
 }
 
+void AssemblyBuilderX64::vmulps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vmulps", dst, src1, src2, 0x59, false, AVX_0F, AVX_NP);
+}
+
 void AssemblyBuilderX64::vdivsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vdivsd", dst, src1, src2, 0x5e, false, AVX_0F, AVX_F2);
+}
+
+void AssemblyBuilderX64::vdivps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vdivps", dst, src1, src2, 0x5e, false, AVX_0F, AVX_NP);
+}
+
+void AssemblyBuilderX64::vandps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vandps", dst, src1, src2, 0x54, false, AVX_0F, AVX_NP);
 }
 
 void AssemblyBuilderX64::vandpd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
@@ -703,6 +785,11 @@ void AssemblyBuilderX64::vandnpd(OperandX64 dst, OperandX64 src1, OperandX64 src
 void AssemblyBuilderX64::vxorpd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vxorpd", dst, src1, src2, 0x57, false, AVX_0F, AVX_66);
+}
+
+void AssemblyBuilderX64::vorps(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vorps", dst, src1, src2, 0x56, false, AVX_0F, AVX_NP);
 }
 
 void AssemblyBuilderX64::vorpd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
@@ -728,11 +815,21 @@ void AssemblyBuilderX64::vcvtsi2sd(OperandX64 dst, OperandX64 src1, OperandX64 s
 void AssemblyBuilderX64::vcvtsd2ss(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     if (src2.cat == CategoryX64::reg)
-        LUAU_ASSERT(src2.base.size == SizeX64::xmmword);
+        CODEGEN_ASSERT(src2.base.size == SizeX64::xmmword);
     else
-        LUAU_ASSERT(src2.memSize == SizeX64::qword);
+        CODEGEN_ASSERT(src2.memSize == SizeX64::qword);
 
     placeAvx("vcvtsd2ss", dst, src1, src2, 0x5a, (src2.cat == CategoryX64::reg ? src2.base.size : src2.memSize) == SizeX64::qword, AVX_0F, AVX_F2);
+}
+
+void AssemblyBuilderX64::vcvtss2sd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    if (src2.cat == CategoryX64::reg)
+        CODEGEN_ASSERT(src2.base.size == SizeX64::xmmword);
+    else
+        CODEGEN_ASSERT(src2.memSize == SizeX64::dword);
+
+    placeAvx("vcvtss2sd", dst, src1, src2, 0x5a, false, AVX_0F, AVX_F3);
 }
 
 void AssemblyBuilderX64::vroundsd(OperandX64 dst, OperandX64 src1, OperandX64 src2, RoundingModeX64 roundingMode)
@@ -804,19 +901,19 @@ void AssemblyBuilderX64::vmovq(OperandX64 dst, OperandX64 src)
 {
     if (dst.base.size == SizeX64::xmmword)
     {
-        LUAU_ASSERT(dst.cat == CategoryX64::reg);
-        LUAU_ASSERT(src.base.size == SizeX64::qword);
+        CODEGEN_ASSERT(dst.cat == CategoryX64::reg);
+        CODEGEN_ASSERT(src.base.size == SizeX64::qword);
         placeAvx("vmovq", dst, src, 0x6e, true, AVX_0F, AVX_66);
     }
     else if (dst.base.size == SizeX64::qword)
     {
-        LUAU_ASSERT(src.cat == CategoryX64::reg);
-        LUAU_ASSERT(src.base.size == SizeX64::xmmword);
+        CODEGEN_ASSERT(src.cat == CategoryX64::reg);
+        CODEGEN_ASSERT(src.base.size == SizeX64::xmmword);
         placeAvx("vmovq", src, dst, 0x7e, true, AVX_0F, AVX_66);
     }
     else
     {
-        LUAU_ASSERT(!"No encoding for left operand of this category");
+        CODEGEN_ASSERT(!"No encoding for left operand of this category");
     }
 }
 
@@ -830,6 +927,11 @@ void AssemblyBuilderX64::vminsd(OperandX64 dst, OperandX64 src1, OperandX64 src2
     placeAvx("vminsd", dst, src1, src2, 0x5d, false, AVX_0F, AVX_F2);
 }
 
+void AssemblyBuilderX64::vcmpeqsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
+{
+    placeAvx("vcmpeqsd", dst, src1, src2, 0x00, 0xc2, false, AVX_0F, AVX_F2);
+}
+
 void AssemblyBuilderX64::vcmpltsd(OperandX64 dst, OperandX64 src1, OperandX64 src2)
 {
     placeAvx("vcmpltsd", dst, src1, src2, 0x01, 0xc2, false, AVX_0F, AVX_F2);
@@ -841,6 +943,22 @@ void AssemblyBuilderX64::vblendvpd(RegisterX64 dst, RegisterX64 src1, OperandX64
     placeAvx("vblendvpd", dst, src1, mask, src3.index << 4, 0x4b, false, AVX_0F3A, AVX_66);
 }
 
+void AssemblyBuilderX64::vpshufps(RegisterX64 dst, RegisterX64 src1, OperandX64 src2, uint8_t shuffle)
+{
+    placeAvx("vpshufps", dst, src1, src2, shuffle, 0xc6, false, AVX_0F, AVX_NP);
+}
+
+void AssemblyBuilderX64::vpinsrd(RegisterX64 dst, RegisterX64 src1, OperandX64 src2, uint8_t offset)
+{
+    placeAvx("vpinsrd", dst, src1, src2, offset, 0x22, false, AVX_0F3A, AVX_66);
+}
+
+void AssemblyBuilderX64::vdpps(OperandX64 dst, OperandX64 src1, OperandX64 src2, uint8_t mask)
+{
+    LUAU_ASSERT(FFlag::LuauVectorLibNativeDot);
+    placeAvx("vdpps", dst, src1, src2, mask, 0x40, false, AVX_0F3A, AVX_66);
+}
+
 bool AssemblyBuilderX64::finalize()
 {
     code.resize(codePos - code.data());
@@ -849,7 +967,7 @@ bool AssemblyBuilderX64::finalize()
     for (Label fixup : pendingLabels)
     {
         // If this assertion fires, a label was used in jmp without calling setLabel
-        LUAU_ASSERT(labelLocations[fixup.id - 1] != ~0u);
+        CODEGEN_ASSERT(labelLocations[fixup.id - 1] != ~0u);
         uint32_t value = labelLocations[fixup.id - 1] - (fixup.location + 4);
         writeu32(&code[fixup.location], value);
     }
@@ -893,6 +1011,26 @@ void AssemblyBuilderX64::setLabel(Label& label)
         log(label);
 }
 
+OperandX64 AssemblyBuilderX64::i32(int32_t value)
+{
+    uint32_t as32BitKey = value;
+
+    if (as32BitKey != ~0u)
+    {
+        if (int32_t* prev = constCache32.find(as32BitKey))
+            return OperandX64(SizeX64::dword, noreg, 1, rip, *prev);
+    }
+
+    size_t pos = allocateData(4, 4);
+    writeu32(&data[pos], value);
+    int32_t offset = int32_t(pos - data.size());
+
+    if (as32BitKey != ~0u)
+        constCache32[as32BitKey] = offset;
+
+    return OperandX64(SizeX64::dword, noreg, 1, rip, offset);
+}
+
 OperandX64 AssemblyBuilderX64::i64(int64_t value)
 {
     uint64_t as64BitKey = value;
@@ -915,9 +1053,24 @@ OperandX64 AssemblyBuilderX64::i64(int64_t value)
 
 OperandX64 AssemblyBuilderX64::f32(float value)
 {
+    uint32_t as32BitKey;
+    static_assert(sizeof(as32BitKey) == sizeof(value), "Expecting float to be 32-bit");
+    memcpy(&as32BitKey, &value, sizeof(value));
+
+    if (as32BitKey != ~0u)
+    {
+        if (int32_t* prev = constCache32.find(as32BitKey))
+            return OperandX64(SizeX64::dword, noreg, 1, rip, *prev);
+    }
+
     size_t pos = allocateData(4, 4);
     writef32(&data[pos], value);
-    return OperandX64(SizeX64::dword, noreg, 1, rip, int32_t(pos - data.size()));
+    int32_t offset = int32_t(pos - data.size());
+
+    if (as32BitKey != ~0u)
+        constCache32[as32BitKey] = offset;
+
+    return OperandX64(SizeX64::dword, noreg, 1, rip, offset);
 }
 
 OperandX64 AssemblyBuilderX64::f64(double value)
@@ -940,6 +1093,16 @@ OperandX64 AssemblyBuilderX64::f64(double value)
         constCache64[as64BitKey] = offset;
 
     return OperandX64(SizeX64::qword, noreg, 1, rip, offset);
+}
+
+OperandX64 AssemblyBuilderX64::u32x4(uint32_t x, uint32_t y, uint32_t z, uint32_t w)
+{
+    size_t pos = allocateData(16, 16);
+    writeu32(&data[pos], x);
+    writeu32(&data[pos + 4], y);
+    writeu32(&data[pos + 8], z);
+    writeu32(&data[pos + 12], w);
+    return OperandX64(SizeX64::xmmword, noreg, 1, rip, int32_t(pos - data.size()));
 }
 
 OperandX64 AssemblyBuilderX64::f32x4(float x, float y, float z, float w)
@@ -982,8 +1145,24 @@ uint32_t AssemblyBuilderX64::getCodeSize() const
     return uint32_t(codePos - code.data());
 }
 
-void AssemblyBuilderX64::placeBinary(const char* name, OperandX64 lhs, OperandX64 rhs, uint8_t codeimm8, uint8_t codeimm, uint8_t codeimmImm8,
-    uint8_t code8rev, uint8_t coderev, uint8_t code8, uint8_t code, uint8_t opreg)
+unsigned AssemblyBuilderX64::getInstructionCount() const
+{
+    return instructionCount;
+}
+
+void AssemblyBuilderX64::placeBinary(
+    const char* name,
+    OperandX64 lhs,
+    OperandX64 rhs,
+    uint8_t codeimm8,
+    uint8_t codeimm,
+    uint8_t codeimmImm8,
+    uint8_t code8rev,
+    uint8_t coderev,
+    uint8_t code8,
+    uint8_t code,
+    uint8_t opreg
+)
 {
     if (logText)
         log(name, lhs, rhs);
@@ -995,16 +1174,16 @@ void AssemblyBuilderX64::placeBinary(const char* name, OperandX64 lhs, OperandX6
     else if (lhs.cat == CategoryX64::mem && rhs.cat == CategoryX64::reg)
         placeBinaryRegMemAndReg(lhs, rhs, code8rev, coderev);
     else
-        LUAU_ASSERT(!"No encoding for this operand combination");
+        CODEGEN_ASSERT(!"No encoding for this operand combination");
 }
 
 void AssemblyBuilderX64::placeBinaryRegMemAndImm(OperandX64 lhs, OperandX64 rhs, uint8_t code8, uint8_t code, uint8_t codeImm8, uint8_t opreg)
 {
-    LUAU_ASSERT(lhs.cat == CategoryX64::reg || lhs.cat == CategoryX64::mem);
-    LUAU_ASSERT(rhs.cat == CategoryX64::imm);
+    CODEGEN_ASSERT(lhs.cat == CategoryX64::reg || lhs.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(rhs.cat == CategoryX64::imm);
 
     SizeX64 size = lhs.cat == CategoryX64::reg ? lhs.base.size : lhs.memSize;
-    LUAU_ASSERT(size == SizeX64::byte || size == SizeX64::dword || size == SizeX64::qword);
+    CODEGEN_ASSERT(size == SizeX64::byte || size == SizeX64::dword || size == SizeX64::qword);
 
     placeRex(lhs);
 
@@ -1016,7 +1195,7 @@ void AssemblyBuilderX64::placeBinaryRegMemAndImm(OperandX64 lhs, OperandX64 rhs,
     }
     else
     {
-        LUAU_ASSERT(size == SizeX64::dword || size == SizeX64::qword);
+        CODEGEN_ASSERT(size == SizeX64::dword || size == SizeX64::qword);
 
         if (int8_t(rhs.imm) == rhs.imm && code != codeImm8)
         {
@@ -1037,11 +1216,14 @@ void AssemblyBuilderX64::placeBinaryRegMemAndImm(OperandX64 lhs, OperandX64 rhs,
 
 void AssemblyBuilderX64::placeBinaryRegAndRegMem(OperandX64 lhs, OperandX64 rhs, uint8_t code8, uint8_t code)
 {
-    LUAU_ASSERT(lhs.cat == CategoryX64::reg && (rhs.cat == CategoryX64::reg || rhs.cat == CategoryX64::mem));
-    LUAU_ASSERT(lhs.base.size == (rhs.cat == CategoryX64::reg ? rhs.base.size : rhs.memSize));
+    CODEGEN_ASSERT(lhs.cat == CategoryX64::reg && (rhs.cat == CategoryX64::reg || rhs.cat == CategoryX64::mem));
+    CODEGEN_ASSERT(lhs.base.size == (rhs.cat == CategoryX64::reg ? rhs.base.size : rhs.memSize));
 
     SizeX64 size = lhs.base.size;
-    LUAU_ASSERT(size == SizeX64::byte || size == SizeX64::dword || size == SizeX64::qword);
+    CODEGEN_ASSERT(size == SizeX64::byte || size == SizeX64::word || size == SizeX64::dword || size == SizeX64::qword);
+
+    if (size == SizeX64::word)
+        place(0x66);
 
     placeRex(lhs.base, rhs);
     place(size == SizeX64::byte ? code8 : code);
@@ -1061,10 +1243,10 @@ void AssemblyBuilderX64::placeUnaryModRegMem(const char* name, OperandX64 op, ui
     if (logText)
         log(name, op);
 
-    LUAU_ASSERT(op.cat == CategoryX64::reg || op.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(op.cat == CategoryX64::reg || op.cat == CategoryX64::mem);
 
     SizeX64 size = op.cat == CategoryX64::reg ? op.base.size : op.memSize;
-    LUAU_ASSERT(size == SizeX64::byte || size == SizeX64::dword || size == SizeX64::qword);
+    CODEGEN_ASSERT(size == SizeX64::byte || size == SizeX64::dword || size == SizeX64::qword);
 
     placeRex(op);
     place(size == SizeX64::byte ? code8 : code);
@@ -1078,8 +1260,8 @@ void AssemblyBuilderX64::placeShift(const char* name, OperandX64 lhs, OperandX64
     if (logText)
         log(name, lhs, rhs);
 
-    LUAU_ASSERT(lhs.cat == CategoryX64::reg || lhs.cat == CategoryX64::mem);
-    LUAU_ASSERT(rhs.cat == CategoryX64::imm || (rhs.cat == CategoryX64::reg && rhs.base == cl));
+    CODEGEN_ASSERT(lhs.cat == CategoryX64::reg || lhs.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(rhs.cat == CategoryX64::imm || (rhs.cat == CategoryX64::reg && rhs.base == cl));
 
     SizeX64 size = lhs.base.size;
 
@@ -1092,7 +1274,7 @@ void AssemblyBuilderX64::placeShift(const char* name, OperandX64 lhs, OperandX64
     }
     else if (rhs.cat == CategoryX64::imm)
     {
-        LUAU_ASSERT(int8_t(rhs.imm) == rhs.imm);
+        CODEGEN_ASSERT(int8_t(rhs.imm) == rhs.imm);
 
         place(size == SizeX64::byte ? 0xc0 : 0xc1);
         placeModRegMem(lhs, opreg, /*extraCodeBytes=*/1);
@@ -1121,8 +1303,8 @@ void AssemblyBuilderX64::placeJcc(const char* name, Label& label, uint8_t cc)
 
 void AssemblyBuilderX64::placeAvx(const char* name, OperandX64 dst, OperandX64 src, uint8_t code, bool setW, uint8_t mode, uint8_t prefix)
 {
-    LUAU_ASSERT(dst.cat == CategoryX64::reg);
-    LUAU_ASSERT(src.cat == CategoryX64::reg || src.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(dst.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src.cat == CategoryX64::reg || src.cat == CategoryX64::mem);
 
     if (logText)
         log(name, dst, src);
@@ -1135,9 +1317,17 @@ void AssemblyBuilderX64::placeAvx(const char* name, OperandX64 dst, OperandX64 s
 }
 
 void AssemblyBuilderX64::placeAvx(
-    const char* name, OperandX64 dst, OperandX64 src, uint8_t code, uint8_t coderev, bool setW, uint8_t mode, uint8_t prefix)
+    const char* name,
+    OperandX64 dst,
+    OperandX64 src,
+    uint8_t code,
+    uint8_t coderev,
+    bool setW,
+    uint8_t mode,
+    uint8_t prefix
+)
 {
-    LUAU_ASSERT((dst.cat == CategoryX64::mem && src.cat == CategoryX64::reg) || (dst.cat == CategoryX64::reg && src.cat == CategoryX64::mem));
+    CODEGEN_ASSERT((dst.cat == CategoryX64::mem && src.cat == CategoryX64::reg) || (dst.cat == CategoryX64::reg && src.cat == CategoryX64::mem));
 
     if (logText)
         log(name, dst, src);
@@ -1159,11 +1349,19 @@ void AssemblyBuilderX64::placeAvx(
 }
 
 void AssemblyBuilderX64::placeAvx(
-    const char* name, OperandX64 dst, OperandX64 src1, OperandX64 src2, uint8_t code, bool setW, uint8_t mode, uint8_t prefix)
+    const char* name,
+    OperandX64 dst,
+    OperandX64 src1,
+    OperandX64 src2,
+    uint8_t code,
+    bool setW,
+    uint8_t mode,
+    uint8_t prefix
+)
 {
-    LUAU_ASSERT(dst.cat == CategoryX64::reg);
-    LUAU_ASSERT(src1.cat == CategoryX64::reg);
-    LUAU_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(dst.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src1.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
 
     if (logText)
         log(name, dst, src1, src2);
@@ -1175,12 +1373,12 @@ void AssemblyBuilderX64::placeAvx(
     commit();
 }
 
-void AssemblyBuilderX64::placeAvx(
-    const char* name, OperandX64 dst, OperandX64 src1, OperandX64 src2, uint8_t imm8, uint8_t code, bool setW, uint8_t mode, uint8_t prefix)
+void AssemblyBuilderX64::
+    placeAvx(const char* name, OperandX64 dst, OperandX64 src1, OperandX64 src2, uint8_t imm8, uint8_t code, bool setW, uint8_t mode, uint8_t prefix)
 {
-    LUAU_ASSERT(dst.cat == CategoryX64::reg);
-    LUAU_ASSERT(src1.cat == CategoryX64::reg);
-    LUAU_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(dst.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src1.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
 
     if (logText)
         log(name, dst, src1, src2, imm8);
@@ -1210,7 +1408,7 @@ void AssemblyBuilderX64::placeRex(OperandX64 op)
     else if (op.cat == CategoryX64::mem)
         code = REX_W_BIT(op.memSize == SizeX64::qword) | REX_X(op.index) | REX_B(op.base);
     else
-        LUAU_ASSERT(!"No encoding for left operand of this category");
+        CODEGEN_ASSERT(!"No encoding for left operand of this category");
 
     if (code != 0)
         place(code | 0x40);
@@ -1225,7 +1423,7 @@ void AssemblyBuilderX64::placeRexNoW(OperandX64 op)
     else if (op.cat == CategoryX64::mem)
         code = REX_X(op.index) | REX_B(op.base);
     else
-        LUAU_ASSERT(!"No encoding for left operand of this category");
+        CODEGEN_ASSERT(!"No encoding for left operand of this category");
 
     if (code != 0)
         place(code | 0x40);
@@ -1246,9 +1444,9 @@ void AssemblyBuilderX64::placeRex(RegisterX64 lhs, OperandX64 rhs)
 
 void AssemblyBuilderX64::placeVex(OperandX64 dst, OperandX64 src1, OperandX64 src2, bool setW, uint8_t mode, uint8_t prefix)
 {
-    LUAU_ASSERT(dst.cat == CategoryX64::reg);
-    LUAU_ASSERT(src1.cat == CategoryX64::reg);
-    LUAU_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
+    CODEGEN_ASSERT(dst.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src1.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(src2.cat == CategoryX64::reg || src2.cat == CategoryX64::mem);
 
     place(AVX_3_1());
     place(AVX_3_2(dst.base, src2.index, src2.base, mode));
@@ -1259,13 +1457,13 @@ static uint8_t getScaleEncoding(uint8_t scale)
 {
     static const uint8_t scales[9] = {0xff, 0, 1, 0xff, 2, 0xff, 0xff, 0xff, 3};
 
-    LUAU_ASSERT(scale < 9 && scales[scale] != 0xff);
+    CODEGEN_ASSERT(scale < 9 && scales[scale] != 0xff);
     return scales[scale];
 }
 
 void AssemblyBuilderX64::placeRegAndModRegMem(OperandX64 lhs, OperandX64 rhs, int32_t extraCodeBytes)
 {
-    LUAU_ASSERT(lhs.cat == CategoryX64::reg);
+    CODEGEN_ASSERT(lhs.cat == CategoryX64::reg);
 
     placeModRegMem(rhs, lhs.base.index, extraCodeBytes);
 }
@@ -1313,8 +1511,8 @@ void AssemblyBuilderX64::placeModRegMem(OperandX64 rhs, uint8_t regop, int32_t e
         }
         else if ((base.index & 0x7) == 0b100) // r12/sp-based addressing requires SIB
         {
-            LUAU_ASSERT(rhs.scale == 1);
-            LUAU_ASSERT(index == noreg);
+            CODEGEN_ASSERT(rhs.scale == 1);
+            CODEGEN_ASSERT(index == noreg);
 
             place(MOD_RM(mod, regop, 0b100));
             place(SIB(rhs.scale, 0b100, base.index));
@@ -1348,7 +1546,7 @@ void AssemblyBuilderX64::placeModRegMem(OperandX64 rhs, uint8_t regop, int32_t e
     }
     else
     {
-        LUAU_ASSERT(!"No encoding for right operand of this category");
+        CODEGEN_ASSERT(!"No encoding for right operand of this category");
     }
 }
 
@@ -1366,23 +1564,27 @@ void AssemblyBuilderX64::placeImm8(int32_t imm)
 {
     int8_t imm8 = int8_t(imm);
 
-    if (imm8 == imm)
-        place(imm8);
-    else
-        LUAU_ASSERT(!"Invalid immediate value");
+    place(imm8);
+}
+
+void AssemblyBuilderX64::placeImm16(int16_t imm)
+{
+    uint8_t* pos = codePos;
+    CODEGEN_ASSERT(pos + sizeof(imm) < codeEnd);
+    codePos = writeu16(pos, imm);
 }
 
 void AssemblyBuilderX64::placeImm32(int32_t imm)
 {
     uint8_t* pos = codePos;
-    LUAU_ASSERT(pos + sizeof(imm) < codeEnd);
+    CODEGEN_ASSERT(pos + sizeof(imm) < codeEnd);
     codePos = writeu32(pos, imm);
 }
 
 void AssemblyBuilderX64::placeImm64(int64_t imm)
 {
     uint8_t* pos = codePos;
-    LUAU_ASSERT(pos + sizeof(imm) < codeEnd);
+    CODEGEN_ASSERT(pos + sizeof(imm) < codeEnd);
     codePos = writeu64(pos, imm);
 }
 
@@ -1407,13 +1609,15 @@ void AssemblyBuilderX64::placeLabel(Label& label)
 
 void AssemblyBuilderX64::place(uint8_t byte)
 {
-    LUAU_ASSERT(codePos < codeEnd);
+    CODEGEN_ASSERT(codePos < codeEnd);
     *codePos++ = byte;
 }
 
 void AssemblyBuilderX64::commit()
 {
-    LUAU_ASSERT(codePos <= codeEnd);
+    CODEGEN_ASSERT(codePos <= codeEnd);
+
+    ++instructionCount;
 
     if (unsigned(codeEnd - codePos) < kMaxInstructionLength)
         extend();
@@ -1430,7 +1634,7 @@ void AssemblyBuilderX64::extend()
 
 size_t AssemblyBuilderX64::allocateData(size_t size, size_t align)
 {
-    LUAU_ASSERT(align > 0 && align <= kMaxAlign && (align & (align - 1)) == 0);
+    CODEGEN_ASSERT(align > 0 && align <= kMaxAlign && (align & (align - 1)) == 0);
 
     if (dataPos < size)
     {
@@ -1501,6 +1705,14 @@ void AssemblyBuilderX64::log(const char* opcode, Label label)
     logAppend(" %-12s.L%d\n", opcode, label.id);
 }
 
+void AssemblyBuilderX64::log(const char* opcode, RegisterX64 reg, Label label)
+{
+    logAppend(" %-12s", opcode);
+    log(reg);
+    text.append(",");
+    logAppend(".L%d\n", label.id);
+}
+
 void AssemblyBuilderX64::log(OperandX64 op)
 {
     switch (op.cat)
@@ -1511,11 +1723,16 @@ void AssemblyBuilderX64::log(OperandX64 op)
     case CategoryX64::mem:
         if (op.base == rip)
         {
-            logAppend("%s ptr [.start%+d]", getSizeName(op.memSize), op.imm);
+            if (op.memSize != SizeX64::none)
+                logAppend("%s ptr ", getSizeName(op.memSize));
+            logAppend("[.start%+d]", op.imm);
             return;
         }
 
-        logAppend("%s ptr [", getSizeName(op.memSize));
+        if (op.memSize != SizeX64::none)
+            logAppend("%s ptr ", getSizeName(op.memSize));
+
+        logAppend("[");
 
         if (op.base != noreg)
             logAppend("%s", getRegisterName(op.base));
@@ -1545,7 +1762,7 @@ void AssemblyBuilderX64::log(OperandX64 op)
             logAppend("%Xh", op.imm);
         break;
     default:
-        LUAU_ASSERT(!"Unknown operand category");
+        CODEGEN_ASSERT(!"Unknown operand category");
     }
 }
 
@@ -1553,22 +1770,24 @@ const char* AssemblyBuilderX64::getSizeName(SizeX64 size) const
 {
     static const char* sizeNames[] = {"none", "byte", "word", "dword", "qword", "xmmword", "ymmword"};
 
-    LUAU_ASSERT(unsigned(size) < sizeof(sizeNames) / sizeof(sizeNames[0]));
+    CODEGEN_ASSERT(unsigned(size) < sizeof(sizeNames) / sizeof(sizeNames[0]));
     return sizeNames[unsigned(size)];
 }
 
 const char* AssemblyBuilderX64::getRegisterName(RegisterX64 reg) const
 {
-    static const char* names[][16] = {{"rip", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""},
+    static const char* names[][16] = {
+        {"rip", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""},
         {"al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"},
         {"ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"},
         {"eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"},
         {"rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"},
         {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15"},
-        {"ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7", "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15"}};
+        {"ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7", "ymm8", "ymm9", "ymm10", "ymm11", "ymm12", "ymm13", "ymm14", "ymm15"}
+    };
 
-    LUAU_ASSERT(reg.index < 16);
-    LUAU_ASSERT(reg.size <= SizeX64::ymmword);
+    CODEGEN_ASSERT(reg.index < 16);
+    CODEGEN_ASSERT(reg.size <= SizeX64::ymmword);
     return names[size_t(reg.size)][reg.index];
 }
 

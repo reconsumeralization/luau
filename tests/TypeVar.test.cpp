@@ -219,7 +219,7 @@ TEST_CASE_FIXTURE(Fixture, "UnionTypeIterator_with_only_cyclic_union")
  */
 TEST_CASE_FIXTURE(Fixture, "substitution_skip_failure")
 {
-    Type ftv11{FreeType{TypeLevel{}}};
+    Type ftv11{FreeType{TypeLevel{}, builtinTypes->neverType, builtinTypes->unknownType}};
 
     TypePackVar tp24{TypePack{{&ftv11}}};
     TypePackVar tp17{TypePack{}};
@@ -292,13 +292,22 @@ TEST_CASE_FIXTURE(Fixture, "substitution_skip_failure")
     TypeId root = &ttvTweenResult;
 
     ModulePtr currentModule = std::make_shared<Module>();
-    Anyification anyification(&currentModule->internalTypes, frontend.globals.globalScope, builtinTypes, &frontend.iceHandler, builtinTypes->anyType,
-        builtinTypes->anyTypePack);
+    Anyification anyification(
+        &currentModule->internalTypes,
+        frontend.globals.globalScope,
+        builtinTypes,
+        &frontend.iceHandler,
+        builtinTypes->anyType,
+        builtinTypes->anyTypePack
+    );
     std::optional<TypeId> any = anyification.substitute(root);
 
     REQUIRE(!anyification.normalizationTooComplex);
     REQUIRE(any.has_value());
-    CHECK_EQ("{| f: t1 |} where t1 = () -> {| f: () -> {| f: ({| f: t1 |}) -> (), signal: {| f: (any) -> () |} |} |}", toString(*any));
+    if (FFlag::LuauSolverV2)
+        CHECK_EQ("{ f: t1 } where t1 = () -> { f: () -> { f: ({ f: t1 }) -> (), signal: { f: (any) -> () } } }", toString(*any));
+    else
+        CHECK_EQ("{| f: t1 |} where t1 = () -> {| f: () -> {| f: ({| f: t1 |}) -> (), signal: {| f: (any) -> () |} |} |}", toString(*any));
 }
 
 TEST_CASE("tagging_tables")
@@ -311,7 +320,7 @@ TEST_CASE("tagging_tables")
 
 TEST_CASE("tagging_classes")
 {
-    Type base{ClassType{"Base", {}, std::nullopt, std::nullopt, {}, nullptr, "Test"}};
+    Type base{ClassType{"Base", {}, std::nullopt, std::nullopt, {}, nullptr, "Test", {}}};
     CHECK(!Luau::hasTag(&base, "foo"));
     Luau::attachTag(&base, "foo");
     CHECK(Luau::hasTag(&base, "foo"));
@@ -319,8 +328,8 @@ TEST_CASE("tagging_classes")
 
 TEST_CASE("tagging_subclasses")
 {
-    Type base{ClassType{"Base", {}, std::nullopt, std::nullopt, {}, nullptr, "Test"}};
-    Type derived{ClassType{"Derived", {}, &base, std::nullopt, {}, nullptr, "Test"}};
+    Type base{ClassType{"Base", {}, std::nullopt, std::nullopt, {}, nullptr, "Test", {}}};
+    Type derived{ClassType{"Derived", {}, &base, std::nullopt, {}, nullptr, "Test", {}}};
 
     CHECK(!Luau::hasTag(&base, "foo"));
     CHECK(!Luau::hasTag(&derived, "foo"));
@@ -460,8 +469,8 @@ TEST_CASE("content_reassignment")
     myAny.documentationSymbol = "@global/any";
 
     TypeArena arena;
-
-    TypeId futureAny = arena.addType(FreeType{TypeLevel{}});
+    BuiltinTypes builtinTypes;
+    TypeId futureAny = arena.freshType(NotNull{&builtinTypes}, TypeLevel{});
     asMutable(futureAny)->reassign(myAny);
 
     CHECK(get<AnyType>(futureAny) != nullptr);

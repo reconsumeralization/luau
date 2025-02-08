@@ -8,16 +8,21 @@
 #include "Luau/ParseResult.h"
 #include "Luau/Scope.h"
 #include "Luau/TypeArena.h"
+#include "Luau/AnyTypeSummary.h"
+#include "Luau/DataFlowGraph.h"
 
 #include <memory>
 #include <vector>
 #include <unordered_map>
 #include <optional>
 
+LUAU_FASTFLAG(LuauIncrementalAutocompleteCommentDetection)
+
 namespace Luau
 {
 
 struct Module;
+struct AnyTypeSummary;
 
 using ScopePtr = std::shared_ptr<struct Scope>;
 using ModulePtr = std::shared_ptr<Module>;
@@ -52,6 +57,7 @@ struct SourceModule
     }
 };
 
+bool isWithinComment(const std::vector<Comment>& commentLocations, Position pos);
 bool isWithinComment(const SourceModule& sourceModule, Position pos);
 bool isWithinComment(const ParseResult& result, Position pos);
 
@@ -65,11 +71,18 @@ struct Module
 {
     ~Module();
 
+    // TODO: Clip this when we clip FFlagLuauSolverV2
+    bool checkedInNewSolver = false;
+
     ModuleName name;
     std::string humanReadableName;
 
     TypeArena interfaceTypes;
     TypeArena internalTypes;
+
+    // Summary of Ast Nodes that either contain
+    // user annotated anys or typechecker inferred anys
+    AnyTypeSummary ats{};
 
     // Scopes and AST types refer to parse data, so we need to keep that alive
     std::shared_ptr<Allocator> allocator;
@@ -81,13 +94,37 @@ struct Module
     DenseHashMap<const AstExpr*, TypePackId> astTypePacks{nullptr};
     DenseHashMap<const AstExpr*, TypeId> astExpectedTypes{nullptr};
 
+    // For AST nodes that are function calls, this map provides the
+    // unspecialized type of the function that was called. If a function call
+    // resolves to a __call metamethod application, this map will point at that
+    // metamethod.
+    //
+    // This is useful for type checking and Signature Help.
     DenseHashMap<const AstNode*, TypeId> astOriginalCallTypes{nullptr};
+
+    // The specialization of a function that was selected.  If the function is
+    // generic, those generic type parameters will be replaced with the actual
+    // types that were passed.  If the function is an overload, this map will
+    // point at the specific overloads that were selected.
     DenseHashMap<const AstNode*, TypeId> astOverloadResolvedTypes{nullptr};
+
+    // Only used with for...in loops.  The computed type of the next() function
+    // is kept here for type checking.
+    DenseHashMap<const AstNode*, TypeId> astForInNextTypes{nullptr};
 
     DenseHashMap<const AstType*, TypeId> astResolvedTypes{nullptr};
     DenseHashMap<const AstTypePack*, TypePackId> astResolvedTypePacks{nullptr};
 
-    // Map AST nodes to the scope they create.  Cannot be NotNull<Scope> because we need a sentinel value for the map.
+    // The computed result type of a compound assignment. (eg foo += 1)
+    //
+    // Type checking uses this to check that the result of such an operation is
+    // actually compatible with the left-side operand.
+    DenseHashMap<const AstStat*, TypeId> astCompoundAssignResultTypes{nullptr};
+
+    DenseHashMap<TypeId, std::vector<std::pair<Location, TypeId>>> upperBoundContributors{nullptr};
+
+    // Map AST nodes to the scope they create.  Cannot be NotNull<Scope> because
+    // we need a sentinel value for the map.
     DenseHashMap<const AstNode*, Scope*> astScopes{nullptr};
 
     std::unordered_map<Name, TypeId> declaredGlobals;
@@ -95,16 +132,24 @@ struct Module
     LintResult lintResult;
     Mode mode;
     SourceCode::Type type;
+    double checkDurationSec = 0.0;
     bool timeout = false;
+    bool cancelled = false;
 
     TypePackId returnType = nullptr;
     std::unordered_map<Name, TypeFun> exportedTypeBindings;
 
+    // Arenas related to the DFG must persist after the DFG no longer exists, as
+    // Module objects maintain raw pointers to objects in these arenas.
+    DefArena defArena;
+    RefinementKeyArena keyArena;
+
     bool hasModuleScope() const;
     ScopePtr getModuleScope() const;
 
-    // Once a module has been typechecked, we clone its public interface into a separate arena.
-    // This helps us to force Type ownership into a DAG rather than a DCG.
+    // Once a module has been typechecked, we clone its public interface into a
+    // separate arena. This helps us to force Type ownership into a DAG rather
+    // than a DCG.
     void clonePublicInterface(NotNull<BuiltinTypes> builtinTypes, InternalErrorReporter& ice);
 };
 

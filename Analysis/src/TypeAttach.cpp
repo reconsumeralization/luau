@@ -9,7 +9,7 @@
 #include "Luau/TypeInfer.h"
 #include "Luau/TypePack.h"
 #include "Luau/Type.h"
-#include "Luau/TypeFamily.h"
+#include "Luau/TypeFunction.h"
 
 #include <string>
 
@@ -104,7 +104,14 @@ public:
             return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("string"), std::nullopt, Location());
         case PrimitiveType::Thread:
             return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("thread"), std::nullopt, Location());
+        case PrimitiveType::Buffer:
+            return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("buffer"), std::nullopt, Location());
+        case PrimitiveType::Function:
+            return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("function"), std::nullopt, Location());
+        case PrimitiveType::Table:
+            return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("table"), std::nullopt, Location());
         default:
+            LUAU_ASSERT(false); // this should be unreachable.
             return nullptr;
         }
     }
@@ -138,6 +145,12 @@ public:
     {
         return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("any"), std::nullopt, Location());
     }
+
+    AstType* operator()(const NoRefineType&)
+    {
+        return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("*no-refine*"), std::nullopt, Location());
+    }
+
     AstType* operator()(const TableType& ttv)
     {
         RecursionCounter counter(&count);
@@ -159,7 +172,8 @@ public:
             }
 
             return allocator->alloc<AstTypeReference>(
-                Location(), std::nullopt, AstName(ttv.name->c_str()), std::nullopt, Location(), parameters.size != 0, parameters);
+                Location(), std::nullopt, AstName(ttv.name->c_str()), std::nullopt, Location(), parameters.size != 0, parameters
+            );
         }
 
         if (hasSeen(&ttv))
@@ -227,7 +241,17 @@ public:
             idx++;
         }
 
-        return allocator->alloc<AstTypeTable>(Location(), props);
+        AstTableIndexer* indexer = nullptr;
+        if (ctv.indexer)
+        {
+            RecursionCounter counter(&count);
+
+            indexer = allocator->alloc<AstTableIndexer>();
+            indexer->indexType = Luau::visit(*this, ctv.indexer->indexType->ty);
+            indexer->resultType = Luau::visit(*this, ctv.indexer->indexResultType->ty);
+        }
+
+        return allocator->alloc<AstTypeTable>(Location(), props, indexer);
     }
 
     AstType* operator()(const FunctionType& ftv)
@@ -302,22 +326,24 @@ public:
             retTailAnnotation = rehydrate(*retTail);
 
         return allocator->alloc<AstTypeFunction>(
-            Location(), generics, genericPacks, AstTypeList{argTypes, argTailAnnotation}, argNames, AstTypeList{returnTypes, retTailAnnotation});
+            Location(), generics, genericPacks, AstTypeList{argTypes, argTailAnnotation}, argNames, AstTypeList{returnTypes, retTailAnnotation}
+        );
     }
-    AstType* operator()(const Unifiable::Error&)
+    AstType* operator()(const ErrorType&)
     {
         return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("Unifiable<Error>"), std::nullopt, Location());
     }
     AstType* operator()(const GenericType& gtv)
     {
         return allocator->alloc<AstTypeReference>(
-            Location(), std::nullopt, AstName(getName(allocator, syntheticNames, gtv)), std::nullopt, Location());
+            Location(), std::nullopt, AstName(getName(allocator, syntheticNames, gtv)), std::nullopt, Location()
+        );
     }
     AstType* operator()(const Unifiable::Bound<TypeId>& bound)
     {
         return Luau::visit(*this, bound.boundTo->ty);
     }
-    AstType* operator()(const FreeType& ftv)
+    AstType* operator()(const FreeType& ft)
     {
         return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("free"), std::nullopt, Location());
     }
@@ -360,12 +386,16 @@ public:
     }
     AstType* operator()(const NegationType& ntv)
     {
-        // FIXME: do the same thing we do with ErrorType
-        throw InternalCompilerError("Cannot convert NegationType into AstNode");
+        AstArray<AstTypeOrPack> params;
+        params.size = 1;
+        params.data = static_cast<AstTypeOrPack*>(allocator->allocate(sizeof(AstType*)));
+        params.data[0] = AstTypeOrPack{Luau::visit(*this, ntv.ty->ty), nullptr};
+
+        return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName("negate"), std::nullopt, Location(), true, params);
     }
-    AstType* operator()(const TypeFamilyInstanceType& tfit)
+    AstType* operator()(const TypeFunctionInstanceType& tfit)
     {
-        return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName{tfit.family->name.c_str()}, std::nullopt, Location());
+        return allocator->alloc<AstTypeReference>(Location(), std::nullopt, AstName{tfit.function->name.c_str()}, std::nullopt, Location());
     }
 
 private:
@@ -432,14 +462,14 @@ public:
         return allocator->alloc<AstTypePackGeneric>(Location(), AstName("free"));
     }
 
-    AstTypePack* operator()(const Unifiable::Error&) const
+    AstTypePack* operator()(const ErrorTypePack&) const
     {
         return allocator->alloc<AstTypePackGeneric>(Location(), AstName("Unifiable<Error>"));
     }
 
-    AstTypePack* operator()(const TypeFamilyInstanceTypePack& tfitp) const
+    AstTypePack* operator()(const TypeFunctionInstanceTypePack& tfitp) const
     {
-        return allocator->alloc<AstTypePackGeneric>(Location(), AstName(tfitp.family->name.c_str()));
+        return allocator->alloc<AstTypePackGeneric>(Location(), AstName(tfitp.function->name.c_str()));
     }
 
 private:

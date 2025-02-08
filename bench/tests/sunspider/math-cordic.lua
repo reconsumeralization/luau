@@ -23,7 +23,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. 
  ]]
 
- local bench = script and require(script.Parent.bench_support) or require("bench_support")
+ local function prequire(name) local success, result = pcall(require, name); return success and result end
+local bench = script and require(script.Parent.bench_support) or prequire("bench_support") or require("../../bench_support")
 
 function test()
 

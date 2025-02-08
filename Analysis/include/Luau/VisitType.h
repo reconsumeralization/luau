@@ -7,10 +7,10 @@
 #include "Luau/RecursionCounter.h"
 #include "Luau/TypePack.h"
 #include "Luau/Type.h"
+#include "Type.h"
 
 LUAU_FASTINT(LuauVisitRecursionLimit)
-LUAU_FASTFLAG(LuauBoundLazyTypes2)
-LUAU_FASTFLAG(DebugLuauReadWriteProperties)
+LUAU_FASTFLAG(LuauSolverV2)
 
 namespace Luau
 {
@@ -64,6 +64,9 @@ inline void unsee(DenseHashSet<void*>& seen, const void* tv)
 
 } // namespace visit_detail
 
+// recursion counter is equivalent here, but we'd like a better name to express the intent.
+using TypeFunctionDepthCounter = RecursionCounter;
+
 template<typename S>
 struct GenericTypeVisitor
 {
@@ -72,6 +75,7 @@ struct GenericTypeVisitor
     Set seen;
     bool skipBoundTypes = false;
     int recursionCounter = 0;
+    int typeFunctionDepth = 0;
 
     GenericTypeVisitor() = default;
 
@@ -80,6 +84,8 @@ struct GenericTypeVisitor
         , skipBoundTypes(skipBoundTypes)
     {
     }
+
+    virtual ~GenericTypeVisitor() {}
 
     virtual void cycle(TypeId) {}
     virtual void cycle(TypePackId) {}
@@ -128,6 +134,10 @@ struct GenericTypeVisitor
     {
         return visit(ty);
     }
+    virtual bool visit(TypeId ty, const NoRefineType& nrt)
+    {
+        return visit(ty);
+    }
     virtual bool visit(TypeId ty, const UnknownType& utv)
     {
         return visit(ty);
@@ -160,7 +170,7 @@ struct GenericTypeVisitor
     {
         return visit(ty);
     }
-    virtual bool visit(TypeId ty, const TypeFamilyInstanceType& tfit)
+    virtual bool visit(TypeId ty, const TypeFunctionInstanceType& tfit)
     {
         return visit(ty);
     }
@@ -181,7 +191,7 @@ struct GenericTypeVisitor
     {
         return visit(tp);
     }
-    virtual bool visit(TypePackId tp, const Unifiable::Error& etp)
+    virtual bool visit(TypePackId tp, const ErrorTypePack& etp)
     {
         return visit(tp);
     }
@@ -197,7 +207,7 @@ struct GenericTypeVisitor
     {
         return visit(tp);
     }
-    virtual bool visit(TypePackId tp, const TypeFamilyInstanceTypePack& tfitp)
+    virtual bool visit(TypePackId tp, const TypeFunctionInstanceTypePack& tfitp)
     {
         return visit(tp);
     }
@@ -220,7 +230,26 @@ struct GenericTypeVisitor
                 traverse(btv->boundTo);
         }
         else if (auto ftv = get<FreeType>(ty))
-            visit(ty, *ftv);
+        {
+            if (FFlag::LuauSolverV2)
+            {
+                if (visit(ty, *ftv))
+                {
+                    // TODO: Replace these if statements with assert()s when we
+                    // delete FFlag::LuauSolverV2.
+                    //
+                    // When the old solver is used, these pointers are always
+                    // unused. When the new solver is used, they are never null.
+                    if (ftv->lowerBound)
+                        traverse(ftv->lowerBound);
+
+                    if (ftv->upperBound)
+                        traverse(ftv->upperBound);
+                }
+            }
+            else
+                visit(ty, *ftv);
+        }
         else if (auto gtv = get<GenericType>(ty))
             visit(ty, *gtv);
         else if (auto etv = get<ErrorType>(ty))
@@ -252,12 +281,16 @@ struct GenericTypeVisitor
                 {
                     for (auto& [_name, prop] : ttv->props)
                     {
-                        if (FFlag::DebugLuauReadWriteProperties)
+                        if (FFlag::LuauSolverV2)
                         {
-                            if (auto ty = prop.readType())
+                            if (auto ty = prop.readTy)
                                 traverse(*ty);
 
-                            if (auto ty = prop.writeType())
+                            // In the case that the readType and the writeType
+                            // are the same pointer, just traverse once.
+                            // Traversing each property twice has pretty
+                            // significant performance consequences.
+                            if (auto ty = prop.writeTy; ty && !prop.isShared())
                                 traverse(*ty);
                         }
                         else
@@ -286,12 +319,16 @@ struct GenericTypeVisitor
             {
                 for (const auto& [name, prop] : ctv->props)
                 {
-                    if (FFlag::DebugLuauReadWriteProperties)
+                    if (FFlag::LuauSolverV2)
                     {
-                        if (auto ty = prop.readType())
+                        if (auto ty = prop.readTy)
                             traverse(*ty);
 
-                        if (auto ty = prop.writeType())
+                        // In the case that the readType and the writeType are
+                        // the same pointer, just traverse once. Traversing each
+                        // property twice would have pretty significant
+                        // performance consequences.
+                        if (auto ty = prop.writeTy; ty && !prop.isShared())
                             traverse(*ty);
                     }
                     else
@@ -304,32 +341,53 @@ struct GenericTypeVisitor
                 if (ctv->metatable)
                     traverse(*ctv->metatable);
 
-                if (FFlag::LuauTypecheckClassTypeIndexers)
+                if (ctv->indexer)
                 {
-                    if (ctv->indexer)
-                    {
-                        traverse(ctv->indexer->indexType);
-                        traverse(ctv->indexer->indexResultType);
-                    }
+                    traverse(ctv->indexer->indexType);
+                    traverse(ctv->indexer->indexResultType);
                 }
             }
         }
         else if (auto atv = get<AnyType>(ty))
             visit(ty, *atv);
+        else if (auto nrt = get<NoRefineType>(ty))
+            visit(ty, *nrt);
         else if (auto utv = get<UnionType>(ty))
         {
             if (visit(ty, *utv))
             {
+                bool unionChanged = false;
                 for (TypeId optTy : utv->options)
+                {
                     traverse(optTy);
+                    if (!get<UnionType>(follow(ty)))
+                    {
+                        unionChanged = true;
+                        break;
+                    }
+                }
+
+                if (unionChanged)
+                    traverse(ty);
             }
         }
         else if (auto itv = get<IntersectionType>(ty))
         {
             if (visit(ty, *itv))
             {
+                bool intersectionChanged = false;
                 for (TypeId partTy : itv->parts)
+                {
                     traverse(partTy);
+                    if (!get<IntersectionType>(follow(ty)))
+                    {
+                        intersectionChanged = true;
+                        break;
+                    }
+                }
+
+                if (intersectionChanged)
+                    traverse(ty);
             }
         }
         else if (auto ltv = get<LazyType>(ty))
@@ -365,8 +423,10 @@ struct GenericTypeVisitor
             if (visit(ty, *ntv))
                 traverse(ntv->ty);
         }
-        else if (auto tfit = get<TypeFamilyInstanceType>(ty))
+        else if (auto tfit = get<TypeFunctionInstanceType>(ty))
         {
+            TypeFunctionDepthCounter tfdc{&typeFunctionDepth};
+
             if (visit(ty, *tfit))
             {
                 for (TypeId p : tfit->typeArguments)
@@ -402,7 +462,7 @@ struct GenericTypeVisitor
         else if (auto gtv = get<GenericTypePack>(tp))
             visit(tp, *gtv);
 
-        else if (auto etv = get<Unifiable::Error>(tp))
+        else if (auto etv = get<ErrorTypePack>(tp))
             visit(tp, *etv);
 
         else if (auto pack = get<TypePack>(tp))
@@ -425,8 +485,10 @@ struct GenericTypeVisitor
         }
         else if (auto btp = get<BlockedTypePack>(tp))
             visit(tp, *btp);
-        else if (auto tfitp = get<TypeFamilyInstanceTypePack>(tp))
+        else if (auto tfitp = get<TypeFunctionInstanceTypePack>(tp))
         {
+            TypeFunctionDepthCounter tfdc{&typeFunctionDepth};
+
             if (visit(tp, *tfitp))
             {
                 for (TypeId t : tfitp->typeArguments)
